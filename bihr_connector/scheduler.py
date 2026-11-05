@@ -1,7 +1,8 @@
-"""Brand activation and per-brand incremental refresh.
+"""Brand activation, per-brand incremental refresh, and the scheduler cycle
+loop that ties everything together.
 
 `activate_brand` is pure DB bookkeeping: flips a `Brand` row from inactive to
-active so later cycles (Task 8's `run_cycle`) know to include it.
+active so later cycles (`run_cycle`, below) know to include it.
 
 `refresh_active_brand` is the tighter per-brand loop: pull that brand's
 `PartNumbers`+`Prices` via `BihrClient` (Task 2) and upsert into `Price` and
@@ -14,32 +15,63 @@ The one behavior that must be exactly right (Review Focus #4, per the task
 brief): BIHR rate-limits (HTTP 429) are routine, not exceptional, when many
 brands get refreshed in the same cycle. A 429 must not raise out of
 `refresh_active_brand` and abort whichever caller is looping over several
-brands (Task 8's job) -- it backs off with capped exponential delay, retries
-up to `MAX_RETRIES` times, and if still rate-limited after that, records the
-brand's own `SyncRun` as `status="RATE_LIMITED"` and returns normally.
+brands (`run_cycle`'s job) -- it backs off with capped exponential delay,
+retries up to `MAX_RETRIES` times, and if still rate-limited after that,
+records the brand's own `SyncRun` as `status="RATE_LIMITED"` and returns
+normally.
 
-Full multi-brand/multi-catalog scheduling (due/not-due decisions, the cycle
-loop) is Task 8's job; this module only has the incremental-refresh unit of
-work so far, by design.
+`catalog_due`/`run_cycle`/`main_loop` (Task 8) are the orchestration layer:
+`catalog_due` is a pure due/not-due decision against `SyncState` and a
+cadence; `run_cycle` runs whichever of the four bulk catalogs (Task 4's
+`sync_catalog`) are due per the Global-Constraints cadences below, then
+refreshes every `Brand.is_active` row (this module's own
+`refresh_active_brand`) -- one cycle's worth of work, fully deterministic
+given an explicit `now`, no sleeping; `main_loop` is the thin infinite-loop
+wrapper that is the container's actual entrypoint, calling `run_cycle` once
+per iteration and sleeping `sleep_seconds` in between, catching and logging
+any exception per cycle so one bad cycle (a BIHR outage, a transient DB
+error) doesn't kill the whole container.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from bihr_connector.bihr_client import BihrApiError
 from bihr_connector.catalog_parse import normalize_price
-from bihr_connector.models import Brand, Price, Product, SyncRun
+from bihr_connector.catalog_sync import CatalogType, sync_catalog
+from bihr_connector.models import Brand, Price, Product, SyncRun, SyncState
 
 MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_CAP_SECONDS = 30.0
 RATE_LIMIT_STATUS_CODE = 429
+
+logger = logging.getLogger(__name__)
+
+# Bulk-catalog sync cadences, per the plan's Global Constraints -- named
+# constants here, not re-derived or guessed at a call site. Products and
+# SalesCategories change rarely; Prices and (especially) Stocks are the
+# catalogs BIHR itself updates most often.
+PRODUCTS_CADENCE = timedelta(days=7)
+PRICES_CADENCE = timedelta(hours=24)
+STOCKS_CADENCE = timedelta(hours=6)
+SALES_CATEGORIES_CADENCE = timedelta(days=30)
+
+CATALOG_CADENCES: dict[CatalogType, timedelta] = {
+    "Products": PRODUCTS_CADENCE,
+    "Prices": PRICES_CADENCE,
+    "Stocks": STOCKS_CADENCE,
+    "SalesCategories": SALES_CATEGORIES_CADENCE,
+}
+
+DEFAULT_SLEEP_SECONDS = 300
 
 
 def activate_brand(session: Session, brand_code: str) -> None:
@@ -251,3 +283,143 @@ def _call_with_rate_limit_retry(func, *args):
                 raise _RateLimited() from exc
             delay = min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
             time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# Task 8: the cycle loop
+# ---------------------------------------------------------------------------
+
+
+def catalog_due(state: SyncState | None, cadence: timedelta, now: datetime) -> bool:
+    """Decide whether a bulk catalog is due for a full re-sync.
+
+    Args:
+        state: The catalog's `SyncState` row, or `None` if it has never
+            been synced at all.
+        cadence: How often this catalog should be refreshed (one of the
+            `*_CADENCE` constants above).
+        now: The current time -- always passed explicitly (never read from
+            `datetime.now()` internally) so this stays a pure, deterministic
+            function for testing.
+
+    Returns:
+        `True` if due now, `False` if still within the cadence window.
+        Due whenever there's no record of a *completed* full sync yet --
+        either `state` itself is `None`, or `state.last_full_completed_utc`
+        is still unset (e.g. a prior run started but never finished). Due
+        exactly at the cadence boundary (`now - last_full_completed_utc >=
+        cadence`), not only strictly past it, so a cycle landing precisely
+        on the hour doesn't wait one extra tick.
+    """
+    if state is None or state.last_full_completed_utc is None:
+        return True
+    return now - state.last_full_completed_utc >= cadence
+
+
+def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
+    """Run one full scheduler cycle: due bulk catalogs, then every active
+    brand's incremental refresh.
+
+    Args:
+        session: SQLAlchemy session, passed straight through to
+            `sync_catalog`/`refresh_active_brand` -- each of those already
+            owns its own commit-once-at-the-end transaction, so this
+            function does not wrap them in a further transaction of its
+            own; it is purely a sequencing loop.
+        client: A `BihrClient` (or test double) exposing both the bulk
+            catalog trio (`request_catalog`/`wait_catalog`/
+            `download_catalog_file`) and the per-brand pair
+            (`part_numbers_for_brand`/`prices_for_parts`).
+        now: The current time -- passed explicitly through to `catalog_due`
+            and `refresh_active_brand`'s "what time is this run" bookkeeping,
+            never read from `datetime.now()` internally, so a whole cycle is
+            deterministic and testable without sleeping.
+
+    Returns:
+        The list of `SyncRun` rows produced this cycle, in order: one per
+        bulk catalog that was due (skipped catalogs contribute nothing),
+        then one per active brand refreshed (`Brand.is_active == True`,
+        in `brand_code` order).
+
+    Note on failure isolation: a real failure syncing one bulk catalog, or
+    refreshing one brand (anything other than the already-handled 429 ->
+    `RATE_LIMITED` path inside `refresh_active_brand`), is logged and that
+    item is skipped -- it does not abort the rest of the cycle. This is the
+    same "one bad brand/catalog doesn't take down the whole cycle" principle
+    `refresh_active_brand`'s own 429 handling embodies, extended to cover
+    the failure modes that function still lets propagate (unknown brand,
+    non-429 BihrApiError, DB errors). `main_loop` adds the same safety net
+    one level up, around the whole cycle, as defense in depth -- it should
+    rarely have anything left to catch given this function's own handling.
+    """
+    sync_runs: list[SyncRun] = []
+
+    for catalog_type, cadence in CATALOG_CADENCES.items():
+        state = session.get(SyncState, catalog_type)
+        if not catalog_due(state, cadence, now):
+            continue
+        try:
+            run = sync_catalog(session, client, catalog_type, mode="full")
+        except Exception:
+            logger.exception("run_cycle: sync_catalog failed for catalog_type=%s", catalog_type)
+            continue
+        sync_runs.append(run)
+
+    active_brand_codes = [
+        brand_code
+        for (brand_code,) in session.query(Brand.brand_code)
+        .filter(Brand.is_active.is_(True))
+        .order_by(Brand.brand_code)
+        .all()
+    ]
+    for brand_code in active_brand_codes:
+        try:
+            run = refresh_active_brand(session, client, brand_code)
+        except Exception:
+            logger.exception("run_cycle: refresh_active_brand failed for brand_code=%s", brand_code)
+            continue
+        sync_runs.append(run)
+
+    return sync_runs
+
+
+def main_loop(sleep_seconds: int = DEFAULT_SLEEP_SECONDS) -> None:
+    """Container entrypoint: run `run_cycle` forever, sleeping between
+    cycles, never dying on a single bad cycle.
+
+    Builds its own `BihrClient` and DB session per cycle (via
+    `bihr_connector.db.get_session` and `bihr_connector.config.get_settings`)
+    so a dropped DB connection or an expired BIHR auth token from one cycle
+    can't wedge the next one. Any exception raised by a cycle -- BIHR down,
+    Postgres unreachable, a bug that slipped past `run_cycle`'s own
+    per-item handling -- is caught here, logged, and the loop sleeps and
+    tries again rather than letting the container crash and restart-loop.
+
+    This function is intentionally thin and not itself unit-tested with a
+    mocked infinite loop: its only real logic is "call run_cycle, catch,
+    log, sleep, repeat forever", which is simple enough to verify by
+    reading. `run_cycle` (the actual scheduling decisions) carries the real
+    test coverage.
+    """
+    from bihr_connector.bihr_client import BihrClient
+    from bihr_connector.config import get_settings
+    from bihr_connector.db import get_session
+
+    logger.info("main_loop: starting (sleep_seconds=%s)", sleep_seconds)
+
+    while True:
+        try:
+            settings = get_settings()
+            now = datetime.now(timezone.utc)
+            with BihrClient(settings.BIHR_BASE_URL, settings.BIHR_USERNAME, settings.BIHR_PASSWORD) as client:
+                with get_session() as session:
+                    runs = run_cycle(session, client, now=now)
+            logger.info(
+                "main_loop: cycle complete, %d SyncRun(s): %s",
+                len(runs),
+                [(r.catalog_type, r.mode, r.status) for r in runs],
+            )
+        except Exception:
+            logger.exception("main_loop: cycle failed, will retry after sleep")
+
+        time.sleep(sleep_seconds)

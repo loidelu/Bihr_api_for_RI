@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -18,7 +19,7 @@ from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_c
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
 from bihr_connector.db import get_session
-from bihr_connector.scheduler import activate_brand
+from bihr_connector.scheduler import DEFAULT_SLEEP_SECONDS, activate_brand, main_loop, run_cycle
 
 CATALOG_TYPES: tuple[CatalogType, ...] = ("Products", "Prices", "Stocks", "SalesCategories")
 
@@ -135,6 +136,38 @@ def _cmd_activate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_scheduler(args: argparse.Namespace) -> int:
+    """Run the scheduler loop: due bulk catalogs + every active brand's
+    incremental refresh, forever (the container's entrypoint) -- or just
+    once with `--once`, for manual verification and for the Docker
+    build-verification step."""
+    settings = get_settings()
+    if not settings.BIHR_USERNAME or not settings.BIHR_PASSWORD:
+        print("BIHR_USERNAME/BIHR_PASSWORD are not set (check your .env)", file=sys.stderr)
+        return 2
+
+    if not args.once:
+        main_loop(sleep_seconds=args.sleep_seconds)
+        return 0  # unreachable in practice -- main_loop runs forever
+
+    with BihrClient(settings.BIHR_BASE_URL, settings.BIHR_USERNAME, settings.BIHR_PASSWORD) as client:
+        with get_session() as session:
+            try:
+                runs = run_cycle(session, client, now=datetime.now(timezone.utc))
+            except BihrApiError as exc:
+                print(f"BIHR API error running scheduler cycle: {exc}", file=sys.stderr)
+                return 1
+
+    if not runs:
+        print("Scheduler cycle: nothing due (no catalogs due, no active brands)")
+    for run in runs:
+        print(
+            f"{run.catalog_type} ({run.mode}): status={run.status} "
+            f"new={run.rows_new} modified={run.rows_modified} unchanged={run.rows_unchanged}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bihr-connector", description="BIHR API connector CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -176,6 +209,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="BIHR brand_code to activate (see match-brands --print-report)",
     )
     activate_parser.set_defaults(func=_cmd_activate)
+
+    scheduler_parser = subparsers.add_parser(
+        "run-scheduler",
+        help="Run the scheduler loop (due bulk catalogs + active-brand refresh), forever or once",
+    )
+    scheduler_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single cycle and exit, instead of looping forever (the container's normal mode)",
+    )
+    scheduler_parser.add_argument(
+        "--sleep-seconds",
+        type=int,
+        default=DEFAULT_SLEEP_SECONDS,
+        help=f"Seconds to sleep between cycles when looping forever (default: {DEFAULT_SLEEP_SECONDS})",
+    )
+    scheduler_parser.set_defaults(func=_cmd_run_scheduler)
 
     return parser
 
