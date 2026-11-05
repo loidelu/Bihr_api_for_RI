@@ -54,7 +54,8 @@ def _cmd_sync_brands(args: argparse.Namespace) -> int:
         session.commit()
 
     print(
-        f"Brands: new={result['new']} renamed={result['renamed']} unchanged={result['unchanged']}"
+        f"Brands: new={result['new']} renamed={result['renamed']} "
+        f"unchanged={result['unchanged']} skipped={result['skipped']}"
     )
     return 0
 

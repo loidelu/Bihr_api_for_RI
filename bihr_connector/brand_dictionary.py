@@ -18,20 +18,32 @@ def sync_brand_dictionary(session: Session) -> dict:
     """Scan distinct (brand_code, brand_name) pairs from products table
     and upsert into brands table.
 
+    Products with a NULL brand_code or brand_name are excluded from the
+    dictionary (both columns are nullable per the Task 1 schema) and
+    counted under "skipped" — one count per distinct product part_number
+    affected, not per distinct (brand_code, brand_name) pair — so callers
+    have visibility into how many products were dropped for missing brand
+    data.
+
     Returns:
-        dict: {"new": int, "renamed": int, "unchanged": int}
+        dict: {"new": int, "renamed": int, "unchanged": int, "skipped": int}
     """
-    # Query distinct (brand_code, brand_name) pairs from products where is_present=True
-    query = session.query(
+    present_products = session.query(
+        Product.part_number,
         Product.brand_code,
         Product.brand_name,
     ).filter(
         Product.is_present == True,
-        Product.brand_code.isnot(None),
-        Product.brand_name.isnot(None),
-    ).distinct()
+    )
 
-    observed_brands = {row[0]: row[1] for row in query}
+    observed_brands: dict[str, str] = {}
+    skipped_count = 0
+
+    for part_number, brand_code, brand_name in present_products:
+        if brand_code is None or brand_name is None:
+            skipped_count += 1
+            continue
+        observed_brands[brand_code] = brand_name
 
     new_count = 0
     renamed_count = 0
@@ -41,7 +53,8 @@ def sync_brand_dictionary(session: Session) -> dict:
         existing_brand = session.get(Brand, brand_code)
 
         if existing_brand is None:
-            # New brand: create it
+            # New brand: create it. Starts inactive — activation is Task 7's
+            # job (activate_brand), not this dictionary sync's.
             brand = Brand(
                 brand_code=brand_code,
                 brand_name=brand_name,
@@ -64,4 +77,5 @@ def sync_brand_dictionary(session: Session) -> dict:
         "new": new_count,
         "renamed": renamed_count,
         "unchanged": unchanged_count,
+        "skipped": skipped_count,
     }
