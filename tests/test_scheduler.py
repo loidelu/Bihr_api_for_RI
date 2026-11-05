@@ -11,10 +11,14 @@ client must not raise out of `refresh_active_brand` -- it must back off
 `SyncRun` as `status="RATE_LIMITED"` and return normally, so a sibling
 brand's refresh later in the same cycle (Task 8) isn't aborted.
 
-`catalog_due`/`run_cycle` (Task 8) tie `sync_catalog` (Task 4),
+`catalog_due`/`brand_due`/`run_cycle` (Task 8) tie `sync_catalog` (Task 4),
 `refresh_active_brand` (Task 7), and `SyncState` (Task 1) into one
 orchestration cycle: run whichever of the four bulk catalogs are due per
-their Global-Constraints cadence, then refresh every active brand.
+their Global-Constraints cadence, then refresh whichever active brands are
+*also* due per their own incremental cadence (`brand_due`, gated by
+`Settings.INCREMENTAL_REFRESH_HOURS` -- per the plan's preflight ruling,
+deliberately stricter than the bulk cadences but not run on every single
+cycle).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -25,6 +29,7 @@ from bihr_connector.bihr_client import BihrApiError
 from bihr_connector.models import Brand, Price, Product, SyncRun, SyncState
 from bihr_connector.scheduler import (
     activate_brand,
+    brand_due,
     catalog_due,
     refresh_active_brand,
     run_cycle,
@@ -357,6 +362,50 @@ def test_catalog_due_false_when_never_completed_but_started():
 
 
 # ---------------------------------------------------------------------------
+# brand_due -- symmetric with catalog_due, gates refresh_active_brand's own
+# incremental cadence (Settings.INCREMENTAL_REFRESH_HOURS) instead of
+# re-running every active brand on every single cycle.
+# ---------------------------------------------------------------------------
+
+
+def test_brand_due_when_never_refreshed():
+    brand = Brand(brand_code="1063", brand_name="BREMBO", is_active=True)
+    assert brand_due(brand, cadence=timedelta(hours=2), now=FIXED_NOW) is True
+
+
+def test_brand_due_false_within_cadence_window():
+    brand = Brand(
+        brand_code="1063",
+        brand_name="BREMBO",
+        is_active=True,
+        last_incremental_refresh_at=FIXED_NOW - timedelta(minutes=30),
+    )
+    assert brand_due(brand, cadence=timedelta(hours=2), now=FIXED_NOW) is False
+
+
+def test_brand_due_true_after_cadence_window():
+    brand = Brand(
+        brand_code="1063",
+        brand_name="BREMBO",
+        is_active=True,
+        last_incremental_refresh_at=FIXED_NOW - timedelta(hours=3),
+    )
+    assert brand_due(brand, cadence=timedelta(hours=2), now=FIXED_NOW) is True
+
+
+def test_brand_due_true_exactly_at_cadence_boundary():
+    """Exactly at the boundary counts as due, matching `catalog_due`'s
+    own `>=` (not strictly `>`) semantics."""
+    brand = Brand(
+        brand_code="1063",
+        brand_name="BREMBO",
+        is_active=True,
+        last_incremental_refresh_at=FIXED_NOW - timedelta(hours=2),
+    )
+    assert brand_due(brand, cadence=timedelta(hours=2), now=FIXED_NOW) is True
+
+
+# ---------------------------------------------------------------------------
 # run_cycle
 # ---------------------------------------------------------------------------
 
@@ -446,6 +495,67 @@ def test_run_cycle_only_refreshes_active_brands(db_session, fake_full_cycle_clie
     run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
 
     assert fake_full_cycle_client.refreshed_brand_codes == ["1063"]
+
+
+def test_run_cycle_skips_brand_refreshed_within_incremental_cadence(db_session, fake_full_cycle_client):
+    """An active brand refreshed recently (within the default
+    INCREMENTAL_REFRESH_HOURS=2h) must not be refreshed again this cycle --
+    the preflight ruling's whole point: incremental refresh runs on its own
+    cadence, not on every single `run_cycle` call."""
+    recently_refreshed = _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
+    recently_refreshed.last_incremental_refresh_at = FIXED_NOW - timedelta(minutes=30)
+    stale = _seed_brand_for_cycle(db_session, brand_code="1064", is_active=True)
+    stale.last_incremental_refresh_at = FIXED_NOW - timedelta(hours=3)
+    never_refreshed = _seed_brand_for_cycle(db_session, brand_code="1065", is_active=True)
+    db_session.commit()
+
+    run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
+
+    assert set(fake_full_cycle_client.refreshed_brand_codes) == {"1064", "1065"}
+
+
+def test_run_cycle_updates_brand_last_incremental_refresh_at_on_success(db_session, fake_full_cycle_client):
+    """A successful incremental refresh this cycle must stamp
+    `last_incremental_refresh_at` so the *next* cycle's `brand_due` check
+    sees it and skips the brand until the cadence elapses again.
+
+    Note: `refresh_active_brand` (Task 7) stamps this with its own
+    `datetime.now(timezone.utc)` internally, not the `now` passed into
+    `run_cycle` -- same pre-existing design as every other timestamp it
+    writes (`SyncRun.started_at` etc.), unchanged by this fix. So this
+    assertion checks "set to a real recent time", not equality with
+    `FIXED_NOW`.
+    """
+    before = datetime.now(timezone.utc)
+    _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
+
+    run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    brand = db_session.get(Brand, "1063")
+    assert brand.last_incremental_refresh_at is not None
+    assert brand.last_incremental_refresh_at >= before
+
+
+def test_run_cycle_does_not_update_last_incremental_refresh_at_when_rate_limited(db_session):
+    """A RATE_LIMITED refresh must NOT stamp `last_incremental_refresh_at`
+    -- the brand should stay due and be retried on the very next cycle
+    rather than waiting out the full incremental cadence because it merely
+    got rate-limited once."""
+
+    class AlwaysRateLimitedClient(FakeFullCycleBihrClient):
+        def part_numbers_for_brand(self, brand_name):
+            self.refreshed_brand_codes.append(brand_name)
+            raise BihrApiError("HTTP 429: rate limited", status_code=429)
+
+    client = AlwaysRateLimitedClient()
+    _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
+
+    run_cycle(db_session, client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    brand = db_session.get(Brand, "1063")
+    assert brand.last_incremental_refresh_at is None
 
 
 def test_run_cycle_runs_all_four_bulk_catalogs_when_none_synced_yet(db_session, fake_full_cycle_client):

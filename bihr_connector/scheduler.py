@@ -20,17 +20,22 @@ retries up to `MAX_RETRIES` times, and if still rate-limited after that,
 records the brand's own `SyncRun` as `status="RATE_LIMITED"` and returns
 normally.
 
-`catalog_due`/`run_cycle`/`main_loop` (Task 8) are the orchestration layer:
-`catalog_due` is a pure due/not-due decision against `SyncState` and a
-cadence; `run_cycle` runs whichever of the four bulk catalogs (Task 4's
+`catalog_due`/`brand_due`/`run_cycle`/`main_loop` (Task 8) are the
+orchestration layer: `catalog_due` is a pure due/not-due decision against
+`SyncState` and a cadence; `brand_due` is the symmetric check for a single
+`Brand`'s own incremental-refresh cadence
+(`Settings.INCREMENTAL_REFRESH_HOURS`, default 2h, per the plan's preflight
+ruling that incremental refresh must run on its own cadence -- stricter
+than the bulk catalogs' but not unbounded -- not on every single cycle);
+`run_cycle` runs whichever of the four bulk catalogs (Task 4's
 `sync_catalog`) are due per the Global-Constraints cadences below, then
-refreshes every `Brand.is_active` row (this module's own
-`refresh_active_brand`) -- one cycle's worth of work, fully deterministic
-given an explicit `now`, no sleeping; `main_loop` is the thin infinite-loop
-wrapper that is the container's actual entrypoint, calling `run_cycle` once
-per iteration and sleeping `sleep_seconds` in between, catching and logging
-any exception per cycle so one bad cycle (a BIHR outage, a transient DB
-error) doesn't kill the whole container.
+refreshes whichever `Brand.is_active` rows are *also* due per `brand_due`
+(this module's own `refresh_active_brand`) -- one cycle's worth of work,
+fully deterministic given an explicit `now`, no sleeping; `main_loop` is
+the thin infinite-loop wrapper that is the container's actual entrypoint,
+calling `run_cycle` once per iteration and sleeping `sleep_seconds` in
+between, catching and logging any exception per cycle so one bad cycle (a
+BIHR outage, a transient DB error) doesn't kill the whole container.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from sqlalchemy.orm import Session
 from bihr_connector.bihr_client import BihrApiError
 from bihr_connector.catalog_parse import normalize_price
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
+from bihr_connector.config import get_settings
 from bihr_connector.models import Brand, Price, Product, SyncRun, SyncState
 
 MAX_RETRIES = 3
@@ -247,6 +253,16 @@ def refresh_active_brand(session: Session, client: Any, brand_code: str) -> Sync
             error_message=None,
         )
         session.add(sync_run)
+
+        # Record the refresh timestamp only on a genuine SUCCESS, in the
+        # same transaction/commit as the upsert and SyncRun row above --
+        # this is what `brand_due` (below) checks to gate how often a
+        # brand gets re-refreshed. A RATE_LIMITED run (the two early
+        # returns above) deliberately does *not* touch this field, so a
+        # rate-limited brand stays due and gets retried on the very next
+        # cycle rather than waiting out the full incremental cadence.
+        brand.last_incremental_refresh_at = now
+
         session.commit()
     except Exception:
         session.rollback()
@@ -316,6 +332,37 @@ def catalog_due(state: SyncState | None, cadence: timedelta, now: datetime) -> b
     return now - state.last_full_completed_utc >= cadence
 
 
+def brand_due(brand: Brand, cadence: timedelta, now: datetime) -> bool:
+    """Decide whether an active brand is due for its incremental refresh.
+
+    Symmetric with `catalog_due`, gating `refresh_active_brand` calls in
+    `run_cycle` the same way `catalog_due` gates the bulk catalogs -- per
+    the plan's preflight ruling, incremental refresh must run on its own
+    (stricter, configurable) cadence, not on every single cycle.
+
+    Args:
+        brand: The `Brand` row to check. Its `last_incremental_refresh_at`
+            is set by `refresh_active_brand` only on a genuine `SUCCESS`
+            (never on `RATE_LIMITED`), so a brand that just got
+            rate-limited stays due and is retried next cycle rather than
+            waiting out the full cadence.
+        cadence: How often this brand may be incrementally refreshed
+            (`Settings.INCREMENTAL_REFRESH_HOURS`, as a `timedelta`).
+        now: The current time -- always passed explicitly, never read from
+            `datetime.now()` internally, for the same testability reason
+            as `catalog_due`.
+
+    Returns:
+        `True` if due now -- `brand.last_incremental_refresh_at` is unset
+        (never successfully refreshed yet), or `now -
+        last_incremental_refresh_at >= cadence` (due exactly at the
+        boundary, not only strictly past it, matching `catalog_due`).
+    """
+    if brand.last_incremental_refresh_at is None:
+        return True
+    return now - brand.last_incremental_refresh_at >= cadence
+
+
 def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
     """Run one full scheduler cycle: due bulk catalogs, then every active
     brand's incremental refresh.
@@ -338,8 +385,11 @@ def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
     Returns:
         The list of `SyncRun` rows produced this cycle, in order: one per
         bulk catalog that was due (skipped catalogs contribute nothing),
-        then one per active brand refreshed (`Brand.is_active == True`,
-        in `brand_code` order).
+        then one per active brand that was *also due* for its own
+        incremental cadence (`Brand.is_active == True` and `brand_due(...)`,
+        in `brand_code` order) -- a brand refreshed within the last
+        `Settings.INCREMENTAL_REFRESH_HOURS` hours is skipped, same as a
+        bulk catalog still within its own cadence window.
 
     Note on failure isolation: a real failure syncing one bulk catalog, or
     refreshing one brand (anything other than the already-handled 429 ->
@@ -365,18 +415,20 @@ def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
             continue
         sync_runs.append(run)
 
-    active_brand_codes = [
-        brand_code
-        for (brand_code,) in session.query(Brand.brand_code)
+    incremental_cadence = timedelta(hours=get_settings().INCREMENTAL_REFRESH_HOURS)
+    active_brands = (
+        session.query(Brand)
         .filter(Brand.is_active.is_(True))
         .order_by(Brand.brand_code)
         .all()
-    ]
-    for brand_code in active_brand_codes:
+    )
+    for brand in active_brands:
+        if not brand_due(brand, incremental_cadence, now):
+            continue
         try:
-            run = refresh_active_brand(session, client, brand_code)
+            run = refresh_active_brand(session, client, brand.brand_code)
         except Exception:
-            logger.exception("run_cycle: refresh_active_brand failed for brand_code=%s", brand_code)
+            logger.exception("run_cycle: refresh_active_brand failed for brand_code=%s", brand.brand_code)
             continue
         sync_runs.append(run)
 
@@ -402,7 +454,6 @@ def main_loop(sleep_seconds: int = DEFAULT_SLEEP_SECONDS) -> None:
     test coverage.
     """
     from bihr_connector.bihr_client import BihrClient
-    from bihr_connector.config import get_settings
     from bihr_connector.db import get_session
 
     logger.info("main_loop: starting (sleep_seconds=%s)", sleep_seconds)

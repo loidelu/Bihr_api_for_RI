@@ -21,6 +21,12 @@ class Brand(Base):
     activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set by `refresh_active_brand` (scheduler.py) each time this brand's
+    # PartNumbers+Prices are pulled -- lets `run_cycle` gate incremental
+    # refresh on its own cadence (`INCREMENTAL_REFRESH_HOURS`), the same way
+    # `catalog_due` gates the four bulk catalogs on theirs. NULL means never
+    # incrementally refreshed yet (always due).
+    last_incremental_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Product(Base):

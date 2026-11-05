@@ -20,6 +20,11 @@ class Settings:
     # -- never set a default here, and never put the real value in
     # .env.example.
     RI_DATABASE_URL: str = os.environ.get("RI_DATABASE_URL", "")
+    # How often an active brand's incremental refresh (PartNumbers+Prices,
+    # scheduler.refresh_active_brand) may run, in hours. Per the plan's
+    # preflight ruling: deliberately stricter than the bulk catalog
+    # cadences (Stocks' 6h is the tightest) but not unbounded -- default 2h.
+    INCREMENTAL_REFRESH_HOURS: int = int(os.environ.get("INCREMENTAL_REFRESH_HOURS", "2"))
 
 
 def get_settings() -> Settings:
