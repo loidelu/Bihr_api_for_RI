@@ -20,6 +20,10 @@ class Settings:
     # -- never set a default here, and never put the real value in
     # .env.example.
     RI_DATABASE_URL: str = os.environ.get("RI_DATABASE_URL", "")
+    # Schema RI's tables live in on that database. The real production
+    # value is "ri" (see ADR 0005) -- overridable for tests or other
+    # deployments where RI's tables sit in a different schema.
+    RI_SCHEMA: str = os.environ.get("RI_SCHEMA", "ri")
     # How often an active brand's incremental refresh (PartNumbers+Prices,
     # scheduler.refresh_active_brand) may run, in hours. Per the plan's
     # preflight ruling: deliberately stricter than the bulk catalog

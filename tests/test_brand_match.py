@@ -13,7 +13,7 @@ production code) standing in for RI's `core_manufacturers`,
 import os
 
 import pytest
-from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from bihr_connector.brand_match import (
@@ -24,8 +24,20 @@ from bihr_connector.brand_match import (
 from bihr_connector.models import Brand, BrandMatchCandidate
 
 # --- Minimal stand-in RI schema (test-only, not the real RI ORM) ---------
+#
+# Deliberately created under a *non-default* schema ("ri_test", distinct
+# from the real production "ri" value so a stray local Postgres role
+# couldn't be mistaken for the real thing) rather than the connection's
+# default "public" schema. Reflecting these tables by bare name (no
+# schema=) would still succeed here precisely because nothing else in
+# `public` happens to share these names -- which is exactly how the schema
+# gap in production went unnoticed. Living in a real non-default schema
+# makes these tests actually exercise RI_SCHEMA end to end instead of
+# masking the gap.
 
-ri_metadata = MetaData()
+RI_TEST_SCHEMA = "ri_test"
+
+ri_metadata = MetaData(schema=RI_TEST_SCHEMA)
 
 core_manufacturers = Table(
     "core_manufacturers",
@@ -54,12 +66,22 @@ master_products = Table(
 def ri_session():
     """A session pointed at the same test Postgres, seeded with a minimal
     stand-in RI schema (core_manufacturers / source_brand_labels /
-    master_products) instead of the real RI ORM models."""
+    master_products) instead of the real RI ORM models.
+
+    The stand-in tables live under the ``ri_test`` Postgres schema (not
+    ``public``), so these tests only pass if ``compute_brand_match``
+    actually reflects RI's tables schema-qualified -- see
+    ``test_ri_table_reflects_with_configured_schema`` and
+    ``test_compute_brand_match_fails_fast_against_wrong_schema`` below for
+    the tests specifically guarding this.
+    """
     test_db_url = os.environ.get(
         "TEST_DATABASE_URL",
         "postgresql+psycopg://bihr:bihr_test_pw@localhost:55432/bihr_connector_test",
     )
     engine = create_engine(test_db_url, echo=False)
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {RI_TEST_SCHEMA}"))
     ri_metadata.create_all(engine)
 
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -70,6 +92,8 @@ def ri_session():
     session.rollback()
     session.close()
     ri_metadata.drop_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {RI_TEST_SCHEMA}"))
     engine.dispose()
 
 
@@ -101,12 +125,40 @@ def _seed_ri_manufacturer(
     ri_session.flush()
 
 
+def test_ri_table_reflects_with_configured_schema(ri_session):
+    """`_ri_table` must reflect against the schema it's told to, not the
+    connection's default search path -- this is the specific regression
+    the whole-branch review flagged: reflecting RI's tables by bare name
+    with no `schema=` silently resolves against `public`, which only
+    "works" in tests because the stand-in tables also happened to live in
+    `public`. The returned Table object's `.schema` must reflect what was
+    asked for."""
+    from bihr_connector.brand_match import _ri_table
+
+    table = _ri_table(ri_session, "core_manufacturers", ("id", "name"), RI_TEST_SCHEMA)
+    assert table.schema == RI_TEST_SCHEMA
+
+
+def test_compute_brand_match_fails_fast_against_wrong_schema(db_session, ri_session):
+    """If `compute_brand_match` is called with a schema that does not hold
+    RI's tables (e.g. the default "ri" -- these stand-ins live in
+    "ri_test"), reflection must fail loudly (table not found) rather than
+    silently falling back to some other schema on the search path."""
+    from sqlalchemy.exc import NoSuchTableError
+
+    _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
+    _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", brand_code="1063")
+
+    with pytest.raises(NoSuchTableError):
+        compute_brand_match(db_session, ri_session, ri_schema="ri")
+
+
 def test_compute_brand_match_finds_known_brand(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
     _seed_ri_manufacturer(
         ri_session, id=42, name="BREMBO", master_product_count=1074, brand_code="1063"
     )
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     row = next(c for c in candidates if c.brand_code == "1063")
     assert row.matched_manufacturer_id == 42
     assert row.master_product_count == 1074
@@ -115,7 +167,7 @@ def test_compute_brand_match_finds_known_brand(db_session, ri_session):
 
 def test_compute_brand_match_unmatched_brand_is_reported_not_dropped(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     row = next(c for c in candidates if c.brand_code == "9999")
     assert row.matched_manufacturer_id is None
     assert row.master_product_count == 0
@@ -131,7 +183,7 @@ def test_compute_brand_match_matches_via_alias_not_brand_name(db_session, ri_ses
     _seed_ri_manufacturer(
         ri_session, id=7, name="BREMBO", master_product_count=5, brand_code="2001"
     )
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     row = next(c for c in candidates if c.brand_code == "2001")
     assert row.matched_manufacturer_id == 7
     assert row.matched_manufacturer_name == "BREMBO"
@@ -146,7 +198,7 @@ def test_compute_brand_match_covers_every_brand_row(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=3, brand_code="1063")
 
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
 
     assert {c.brand_code for c in candidates} == {"1063", "9999"}
     assert ambiguous == []
@@ -164,7 +216,7 @@ def test_compute_brand_match_ambiguous_alias_is_reported_unmatched_not_dropped(d
     _seed_ri_manufacturer(ri_session, id=10, name="MANUFACTURER-A", brand_code="3001")
     _seed_ri_manufacturer(ri_session, id=11, name="MANUFACTURER-B", brand_code="3001")
 
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
 
     row = next(c for c in candidates if c.brand_code == "3001")
     assert row.matched_manufacturer_id is None
@@ -187,7 +239,7 @@ def test_compute_brand_match_duplicate_alias_rows_same_manufacturer_is_not_ambig
     )
     ri_session.flush()
 
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
 
     row = next(c for c in candidates if c.brand_code == "3002")
     assert row.matched_manufacturer_id == 20
@@ -208,7 +260,7 @@ def test_compute_brand_match_ambiguous_brand_does_not_block_other_brands(db_sess
 
     _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
 
-    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
 
     assert {c.brand_code for c in candidates} == {"3001", "1063", "9999"}
 
@@ -229,7 +281,7 @@ def test_upsert_brand_match_candidates_inserts_new_rows(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=7, brand_code="1063")
 
-    candidates, _ambiguous = compute_brand_match(db_session, ri_session)
+    candidates, _ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     upsert_brand_match_candidates(db_session, candidates)
 
     row = db_session.get(BrandMatchCandidate, "1063")
@@ -244,14 +296,14 @@ def test_upsert_brand_match_candidates_updates_in_place_on_rerun(db_session, ri_
     _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=7, brand_code="1063")
 
-    first, _ambiguous = compute_brand_match(db_session, ri_session)
+    first, _ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     upsert_brand_match_candidates(db_session, first)
 
     # Simulate RI's coverage growing before the next run.
     ri_session.execute(master_products.insert().values(manufacturer_id=42))
     ri_session.flush()
 
-    second, _ambiguous2 = compute_brand_match(db_session, ri_session)
+    second, _ambiguous2 = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
     upsert_brand_match_candidates(db_session, second)
 
     assert db_session.query(BrandMatchCandidate).count() == 1

@@ -2,7 +2,8 @@
 
 Reference Inteligencia ("RI") is a separate, already-existing production
 application outside this repo. The brief (ADR 0005) lists four of its
-tables under the ``ri`` schema, three of which this module queries:
+tables under the ``ri`` schema (configurable via ``settings.RI_SCHEMA``,
+see ``bihr_connector/config.py``), three of which this module queries:
 
 - ``core_manufacturers(id, name)``
 - ``source_brand_labels(brand_code, manufacturer_id)`` -- the alias table
@@ -31,6 +32,7 @@ from datetime import datetime, timezone
 from sqlalchemy import MetaData, Table, func, select
 from sqlalchemy.orm import Session
 
+from bihr_connector.config import get_settings
 from bihr_connector.models import Brand, BrandMatchCandidate
 
 
@@ -56,16 +58,24 @@ class AmbiguousBrandAlias:
     manufacturer_ids: list[int]
 
 
-def _ri_table(ri_session: Session, name: str, columns: tuple[str, ...]) -> Table:
-    """Reflect a single RI table by name from ri_session's bound engine.
+def _ri_table(
+    ri_session: Session, name: str, columns: tuple[str, ...], schema: str
+) -> Table:
+    """Reflect a single RI table by name (and schema) from ri_session's
+    bound engine.
 
     Reflecting per-call (rather than caching module-level Table objects)
     keeps compute_brand_match agnostic about which engine/database
     ri_session is bound to -- it may differ between calls (e.g. tests vs.
     production) and reflection must follow the session, not a fixed engine.
+
+    ``schema`` must be passed explicitly (production RI tables live under
+    the ``ri`` schema, per ADR 0005, not the connection's default
+    ``public`` schema) -- reflecting by bare name would silently resolve
+    against the wrong schema whenever one happens to exist there too.
     """
     metadata = MetaData()
-    table = Table(name, metadata, autoload_with=ri_session.get_bind())
+    table = Table(name, metadata, schema=schema, autoload_with=ri_session.get_bind())
     missing = [c for c in columns if c not in table.columns]
     if missing:
         raise ValueError(f"RI table {name!r} is missing expected column(s): {missing}")
@@ -73,7 +83,7 @@ def _ri_table(ri_session: Session, name: str, columns: tuple[str, ...]) -> Table
 
 
 def compute_brand_match(
-    bihr_session: Session, ri_session: Session
+    bihr_session: Session, ri_session: Session, ri_schema: str | None = None
 ) -> tuple[list[BrandMatchCandidate], list[AmbiguousBrandAlias]]:
     """For every row in ``brands``, look up a matching RI manufacturer by
     exact alias (via ``source_brand_labels.brand_code``), count
@@ -94,14 +104,20 @@ def compute_brand_match(
     normally: one dirty alias row in RI must never prevent the rest of the
     brands from being reported.
 
+    ``ri_schema`` is the schema RI's tables live in on ``ri_session``'s
+    database. Defaults to ``settings.RI_SCHEMA`` (``"ri"`` in production,
+    per ADR 0005) when not given explicitly -- callers such as tests may
+    override it to point at a different schema.
+
     This function only reads; it does not add the returned candidates to
     any session or commit anything. Callers decide how to persist them.
     """
-    core_manufacturers = _ri_table(ri_session, "core_manufacturers", ("id", "name"))
+    schema = ri_schema if ri_schema is not None else get_settings().RI_SCHEMA
+    core_manufacturers = _ri_table(ri_session, "core_manufacturers", ("id", "name"), schema)
     source_brand_labels = _ri_table(
-        ri_session, "source_brand_labels", ("brand_code", "manufacturer_id")
+        ri_session, "source_brand_labels", ("brand_code", "manufacturer_id"), schema
     )
-    master_products = _ri_table(ri_session, "master_products", ("manufacturer_id",))
+    master_products = _ri_table(ri_session, "master_products", ("manufacturer_id",), schema)
 
     brands = bihr_session.execute(select(Brand.brand_code)).scalars().all()
 
