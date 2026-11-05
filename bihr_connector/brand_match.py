@@ -25,6 +25,7 @@ across them in a single query. All cross-referencing happens in Python
 after both sides have been read independently.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import MetaData, Table, func, select
@@ -33,29 +34,26 @@ from sqlalchemy.orm import Session
 from bihr_connector.models import Brand, BrandMatchCandidate
 
 
-class AmbiguousBrandAliasError(Exception):
-    """Raised when a brand_code resolves to more than one distinct
-    manufacturer_id in RI's source_brand_labels.
+@dataclass(frozen=True)
+class AmbiguousBrandAlias:
+    """One brand_code that aliases more than one distinct manufacturer_id
+    in RI's source_brand_labels -- a data-quality conflict on the RI side
+    (e.g. an uncleaned historical rename), not something this connector
+    can resolve on its own.
 
     The brief's own identity rule is "exact alias lookup only, never
     fuzzy" -- silently picking one of several conflicting alias rows would
     undercut that guarantee by making the result depend on arbitrary row
     order. We have no verified column on the real source_brand_labels
     table (e.g. a created/updated timestamp) to justify a deterministic
-    tie-break via ORDER BY, so ambiguity is surfaced loudly instead of
-    silently resolved. Whoever owns the RI alias data decides the real fix
-    (dedupe the aliases, or add a tie-break column) -- this function will
-    not guess.
+    tie-break via ORDER BY, so ambiguity is surfaced as data for the
+    caller to act on, instead of being silently resolved -- but it must
+    not abort the rest of the report: one dirty row in RI is exactly the
+    kind of thing this report exists to surface, not hide behind a crash.
     """
 
-    def __init__(self, brand_code: str, manufacturer_ids: list[int]) -> None:
-        self.brand_code = brand_code
-        self.manufacturer_ids = manufacturer_ids
-        super().__init__(
-            f"brand_code {brand_code!r} has {len(manufacturer_ids)} distinct "
-            f"manufacturer_id aliases in source_brand_labels: {manufacturer_ids} "
-            "-- ambiguous, refusing to silently pick one"
-        )
+    brand_code: str
+    manufacturer_ids: list[int]
 
 
 def _ri_table(ri_session: Session, name: str, columns: tuple[str, ...]) -> Table:
@@ -76,19 +74,25 @@ def _ri_table(ri_session: Session, name: str, columns: tuple[str, ...]) -> Table
 
 def compute_brand_match(
     bihr_session: Session, ri_session: Session
-) -> list[BrandMatchCandidate]:
+) -> tuple[list[BrandMatchCandidate], list[AmbiguousBrandAlias]]:
     """For every row in ``brands``, look up a matching RI manufacturer by
     exact alias (via ``source_brand_labels.brand_code``), count
     ``master_products`` rows for that manufacturer, and return one
-    ``BrandMatchCandidate`` per brand.
+    ``BrandMatchCandidate`` per brand, plus a separate list flagging any
+    brand whose alias was ambiguous.
 
-    Brands with no matching alias are reported with
-    ``matched_manufacturer_id=None`` and ``master_product_count=0`` --
-    never dropped, never raised as an error.
+    Brands with no matching alias (or an ambiguous one -- see below) are
+    reported with ``matched_manufacturer_id=None`` and
+    ``master_product_count=0`` -- never dropped, never allowed to error
+    out the rest of the batch.
 
     Brands whose brand_code aliases more than one distinct
-    manufacturer_id raise ``AmbiguousBrandAliasError`` instead of silently
-    picking one -- see that class's docstring for why.
+    manufacturer_id are reported as unmatched in the returned candidates
+    list *and* appended to the second return value as an
+    ``AmbiguousBrandAlias`` -- see that class's docstring for why we don't
+    try to pick one. Every other brand in the same run is still processed
+    normally: one dirty alias row in RI must never prevent the rest of the
+    brands from being reported.
 
     This function only reads; it does not add the returned candidates to
     any session or commit anything. Callers decide how to persist them.
@@ -103,6 +107,7 @@ def compute_brand_match(
 
     now = datetime.now(timezone.utc)
     candidates: list[BrandMatchCandidate] = []
+    ambiguous: list[AmbiguousBrandAlias] = []
 
     for brand_code in brands:
         alias_manufacturer_ids = sorted(
@@ -116,14 +121,13 @@ def compute_brand_match(
             }
         )
 
-        if len(alias_manufacturer_ids) > 1:
-            raise AmbiguousBrandAliasError(brand_code, alias_manufacturer_ids)
-
         matched_manufacturer_id: int | None = None
         matched_manufacturer_name: str | None = None
         master_product_count = 0
 
-        if alias_manufacturer_ids:
+        if len(alias_manufacturer_ids) > 1:
+            ambiguous.append(AmbiguousBrandAlias(brand_code, alias_manufacturer_ids))
+        elif alias_manufacturer_ids:
             manufacturer_id = alias_manufacturer_ids[0]
             manufacturer_row = ri_session.execute(
                 select(core_manufacturers.c.name).where(
@@ -147,7 +151,7 @@ def compute_brand_match(
             )
         )
 
-    return candidates
+    return candidates, ambiguous
 
 
 def _count_master_products(ri_session: Session, master_products: Table, manufacturer_id: int) -> int:

@@ -14,11 +14,7 @@ from sqlalchemy.orm import sessionmaker
 
 from bihr_connector.bihr_client import BihrApiError, BihrClient
 from bihr_connector.brand_dictionary import sync_brand_dictionary
-from bihr_connector.brand_match import (
-    AmbiguousBrandAliasError,
-    compute_brand_match,
-    upsert_brand_match_candidates,
-)
+from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_candidates
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
 from bihr_connector.db import get_session
@@ -87,11 +83,7 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
 
     try:
         with get_session() as bihr_session:
-            try:
-                candidates = compute_brand_match(bihr_session, ri_session)
-            except AmbiguousBrandAliasError as exc:
-                print(f"Ambiguous brand alias in Reference Inteligencia: {exc}", file=sys.stderr)
-                return 1
+            candidates, ambiguous = compute_brand_match(bihr_session, ri_session)
             upsert_brand_match_candidates(bihr_session, candidates)
             bihr_session.commit()
     finally:
@@ -110,6 +102,20 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
     else:
         matched = sum(1 for c in candidates if c.matched_manufacturer_id is not None)
         print(f"Brand match: {matched}/{len(candidates)} brands matched in Reference Inteligencia")
+
+    if ambiguous:
+        print(
+            f"WARNING: {len(ambiguous)} brand(s) have ambiguous aliases in "
+            "Reference Inteligencia (more than one manufacturer_id for the "
+            "same brand_code) and were reported as unmatched -- needs manual "
+            "cleanup on the RI side:",
+            file=sys.stderr,
+        )
+        for alias in ambiguous:
+            print(
+                f"  brand_code={alias.brand_code} manufacturer_ids={alias.manufacturer_ids}",
+                file=sys.stderr,
+            )
 
     return 0
 

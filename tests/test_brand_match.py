@@ -17,7 +17,7 @@ from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from bihr_connector.brand_match import (
-    AmbiguousBrandAliasError,
+    AmbiguousBrandAlias,
     compute_brand_match,
     upsert_brand_match_candidates,
 )
@@ -106,18 +106,20 @@ def test_compute_brand_match_finds_known_brand(db_session, ri_session):
     _seed_ri_manufacturer(
         ri_session, id=42, name="BREMBO", master_product_count=1074, brand_code="1063"
     )
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
     row = next(c for c in candidates if c.brand_code == "1063")
     assert row.matched_manufacturer_id == 42
     assert row.master_product_count == 1074
+    assert ambiguous == []
 
 
 def test_compute_brand_match_unmatched_brand_is_reported_not_dropped(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
     row = next(c for c in candidates if c.brand_code == "9999")
     assert row.matched_manufacturer_id is None
     assert row.master_product_count == 0
+    assert ambiguous == []
 
 
 def test_compute_brand_match_matches_via_alias_not_brand_name(db_session, ri_session):
@@ -129,11 +131,12 @@ def test_compute_brand_match_matches_via_alias_not_brand_name(db_session, ri_ses
     _seed_ri_manufacturer(
         ri_session, id=7, name="BREMBO", master_product_count=5, brand_code="2001"
     )
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
     row = next(c for c in candidates if c.brand_code == "2001")
     assert row.matched_manufacturer_id == 7
     assert row.matched_manufacturer_name == "BREMBO"
     assert row.master_product_count == 5
+    assert ambiguous == []
 
 
 def test_compute_brand_match_covers_every_brand_row(db_session, ri_session):
@@ -143,25 +146,31 @@ def test_compute_brand_match_covers_every_brand_row(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=3, brand_code="1063")
 
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
 
     assert {c.brand_code for c in candidates} == {"1063", "9999"}
+    assert ambiguous == []
 
 
-def test_compute_brand_match_raises_on_ambiguous_alias(db_session, ri_session):
+def test_compute_brand_match_ambiguous_alias_is_reported_unmatched_not_dropped(db_session, ri_session):
     """A brand_code aliased to two *different* manufacturer_ids in
     source_brand_labels is a real conflict (e.g. a historical rename that
-    wasn't cleaned up on the RI side) -- compute_brand_match must raise
-    AmbiguousBrandAliasError rather than silently picking one row."""
+    wasn't cleaned up on the RI side). compute_brand_match must still
+    return a BrandMatchCandidate for it (treated as unmatched -- picking
+    either conflicting manufacturer would be arbitrary) and flag it in the
+    separate ambiguous list, rather than raising and losing the whole
+    report."""
     _seed_bihr_brand(db_session, brand_code="3001", brand_name="DOUBLE-ALIASED")
     _seed_ri_manufacturer(ri_session, id=10, name="MANUFACTURER-A", brand_code="3001")
     _seed_ri_manufacturer(ri_session, id=11, name="MANUFACTURER-B", brand_code="3001")
 
-    with pytest.raises(AmbiguousBrandAliasError) as exc_info:
-        compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
 
-    assert exc_info.value.brand_code == "3001"
-    assert exc_info.value.manufacturer_ids == [10, 11]
+    row = next(c for c in candidates if c.brand_code == "3001")
+    assert row.matched_manufacturer_id is None
+    assert row.master_product_count == 0
+
+    assert ambiguous == [AmbiguousBrandAlias(brand_code="3001", manufacturer_ids=[10, 11])]
 
 
 def test_compute_brand_match_duplicate_alias_rows_same_manufacturer_is_not_ambiguous(
@@ -169,7 +178,7 @@ def test_compute_brand_match_duplicate_alias_rows_same_manufacturer_is_not_ambig
 ):
     """Two source_brand_labels rows for the same brand_code that both point
     at the *same* manufacturer_id are a harmless duplicate, not a conflict
-    -- must match normally, not raise."""
+    -- must match normally, not be flagged ambiguous."""
     _seed_bihr_brand(db_session, brand_code="3002", brand_name="DUPLICATE-ALIAS-ROWS")
     _seed_ri_manufacturer(ri_session, id=20, name="SAME-MANUFACTURER", master_product_count=4, brand_code="3002")
     # A second alias row, same brand_code, same manufacturer_id.
@@ -178,18 +187,49 @@ def test_compute_brand_match_duplicate_alias_rows_same_manufacturer_is_not_ambig
     )
     ri_session.flush()
 
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
 
     row = next(c for c in candidates if c.brand_code == "3002")
     assert row.matched_manufacturer_id == 20
     assert row.master_product_count == 4
+    assert ambiguous == []
+
+
+def test_compute_brand_match_ambiguous_brand_does_not_block_other_brands(db_session, ri_session):
+    """The exact regression to guard against: one ambiguous brand_code
+    among several must not prevent the rest from being matched and
+    returned -- the whole report must still complete."""
+    _seed_bihr_brand(db_session, brand_code="3001", brand_name="DOUBLE-ALIASED")
+    _seed_ri_manufacturer(ri_session, id=10, name="MANUFACTURER-A", brand_code="3001")
+    _seed_ri_manufacturer(ri_session, id=11, name="MANUFACTURER-B", brand_code="3001")
+
+    _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
+    _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=9, brand_code="1063")
+
+    _seed_bihr_brand(db_session, brand_code="9999", brand_name="MARCA-INEXISTENTE")
+
+    candidates, ambiguous = compute_brand_match(db_session, ri_session)
+
+    assert {c.brand_code for c in candidates} == {"3001", "1063", "9999"}
+
+    brembo_row = next(c for c in candidates if c.brand_code == "1063")
+    assert brembo_row.matched_manufacturer_id == 42
+    assert brembo_row.master_product_count == 9
+
+    unmatched_row = next(c for c in candidates if c.brand_code == "9999")
+    assert unmatched_row.matched_manufacturer_id is None
+
+    ambiguous_row = next(c for c in candidates if c.brand_code == "3001")
+    assert ambiguous_row.matched_manufacturer_id is None
+
+    assert [a.brand_code for a in ambiguous] == ["3001"]
 
 
 def test_upsert_brand_match_candidates_inserts_new_rows(db_session, ri_session):
     _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=7, brand_code="1063")
 
-    candidates = compute_brand_match(db_session, ri_session)
+    candidates, _ambiguous = compute_brand_match(db_session, ri_session)
     upsert_brand_match_candidates(db_session, candidates)
 
     row = db_session.get(BrandMatchCandidate, "1063")
@@ -204,14 +244,14 @@ def test_upsert_brand_match_candidates_updates_in_place_on_rerun(db_session, ri_
     _seed_bihr_brand(db_session, brand_code="1063", brand_name="BREMBO")
     _seed_ri_manufacturer(ri_session, id=42, name="BREMBO", master_product_count=7, brand_code="1063")
 
-    first = compute_brand_match(db_session, ri_session)
+    first, _ambiguous = compute_brand_match(db_session, ri_session)
     upsert_brand_match_candidates(db_session, first)
 
     # Simulate RI's coverage growing before the next run.
     ri_session.execute(master_products.insert().values(manufacturer_id=42))
     ri_session.flush()
 
-    second = compute_brand_match(db_session, ri_session)
+    second, _ambiguous2 = compute_brand_match(db_session, ri_session)
     upsert_brand_match_candidates(db_session, second)
 
     assert db_session.query(BrandMatchCandidate).count() == 1
