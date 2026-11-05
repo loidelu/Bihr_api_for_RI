@@ -340,18 +340,16 @@ bihr-connector run-scheduler [--once] [--sleep-seconds 300]
 
 ## Docker Deployment
 
-Minimal, standard Dockerfile:
+Minimal, standard Dockerfile — matches what the BIHR connector actually ships (migrations are run separately, via `alembic upgrade head` against the target database, not baked into this image or run by its entrypoint):
 
 ```dockerfile
 FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml /app/
-COPY bihr_connector /app/bihr_connector
-COPY alembic /app/alembic
-COPY alembic.ini /app/
+COPY <vendor>_connector /app/<vendor>_connector
 RUN pip install --no-cache-dir .
 # Entrypoint: the infinite scheduler loop
-CMD ["python", "-m", "bihr_connector.cli", "run-scheduler"]
+CMD ["python", "-m", "<vendor>_connector.cli", "run-scheduler"]
 ```
 
 Standard docker-compose.yml:
@@ -372,30 +370,48 @@ services:
 
 ## Testing Strategy
 
-**Unit tests** for each module, using fixtures:
+**Unit tests** for each module, against a real disposable Postgres database — this is what the BIHR connector actually does (see `tests/conftest.py`), not a mocked or in-memory substitute:
 
 ```python
 # conftest.py
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 @pytest.fixture
 def db_session():
-    """In-memory SQLite session for fast tests."""
-    engine = create_engine("sqlite:///:memory:")
+    """Create a test database session with a real Postgres connection."""
+    test_db_url = os.environ.get(
+        "TEST_DATABASE_URL",
+        "postgresql+psycopg://user:password@localhost:5432/connector_test",
+    )
+    engine = create_engine(test_db_url, echo=False)
+
+    # Create all tables fresh for this test
     Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    session = SessionLocal()
+
     yield session
+
+    # Clean up: roll back, close, drop tables so the next test starts clean
+    session.rollback()
     session.close()
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
 
 @pytest.fixture
 def mock_client():
-    """Respx mock for vendor API calls."""
+    """Respx mock for vendor API calls — the HTTP layer is mocked, the DB is not."""
     with respx.mock:
         yield
 ```
 
-**Avoid mocking the database; use a real in-memory SQLite for most tests.** This catches subtle ORM bugs (lazy loading, relationship cascades, etc.) that mocks would hide.
+**Why real Postgres, not SQLite or a mocked session:** Postgres-specific behavior (constraint enforcement, timezone-aware `DateTime` columns, upsert semantics) can differ from SQLite's, and a mocked session hides real ORM bugs (lazy loading, cascades, transaction/rollback behavior) that only show up against a real engine. The cost is that tests need a `TEST_DATABASE_URL` pointing at a disposable database (every test calls `create_all`/`drop_all` around itself, so tests don't leak state into each other) — set this once per developer machine or CI runner, not per test.
 
-**Integration tests** (marked with `@pytest.mark.integration`) can use a real test Postgres instance if needed, but keep them few and slow-running.
+**Mock the HTTP layer, not the database.** Use `respx` (or an equivalent) to mock the vendor API client so tests don't depend on network access or real credentials; let the database layer run for real against `TEST_DATABASE_URL`.
 
 ## Summary of Reusable Principles
 

@@ -249,7 +249,7 @@ Every record (Product, Price, Stock, SalesCategory) stores the complete raw API 
 
 ### Secrets Never Committed
 
-All sensitive values (`BIHR_USERNAME`, `BIHR_PASSWORD`, `RI_DATABASE_URL`) are environment-only. `.env` and `.env.example` are listed in `.gitignore` so credentials are never accidentally pushed to the repository.
+All sensitive values (`BIHR_USERNAME`, `BIHR_PASSWORD`, `RI_DATABASE_URL`) are environment-only. `.env` is listed in `.gitignore` so credentials are never accidentally pushed to the repository. `.env.example` is intentionally *not* gitignored — it's committed as a placeholder template with empty values, which is what Setup Step 1 above points to.
 
 ### Brand Matching Workflow
 
@@ -265,7 +265,7 @@ The canonical pattern for activating new brands:
 
 - **Per-item failure isolation:** If a bulk catalog or brand refresh fails (other than rate-limiting), the error is logged, that item is skipped, and the rest of the cycle continues. There is no backoff or alerting on repeated failures — monitor logs or set up external log aggregation (e.g., Docker to syslog/splunk).
 
-- **Rate limiting (HTTP 429):** The BIHR client detects 429 responses and raises `BihrApiError` with a 60-second backoff recommendation in the message. The scheduler loop logs this, skips the item, and retries in the next cycle (after the configured sleep interval).
+- **Rate limiting (HTTP 429):** Handled internally by `refresh_active_brand`, not by the scheduler loop. On a 429, it retries that brand's own refresh up to `MAX_RETRIES` (3) times with capped exponential backoff. If still rate-limited after exhausting retries, it records that brand's `SyncRun` with `status="RATE_LIMITED"` and returns normally — it never raises an exception out to `run_cycle`. The next brand (and the rest of the cycle) proceeds unaffected; the rate-limited brand is simply picked up again whenever its own incremental-refresh cadence next makes it due.
 
 - **Database connection pooling:** Each scheduler cycle creates a fresh DB session and BihrClient, preventing expired connections or tokens from wedging a long-running container.
 
