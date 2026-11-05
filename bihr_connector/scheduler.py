@@ -87,9 +87,17 @@ def refresh_active_brand(session: Session, client: Any, brand_code: str) -> Sync
 
     Raises:
         ValueError: if `brand_code` doesn't exist in the `brands` table.
-        BihrApiError: for any BIHR API failure that is *not* a 429 (e.g.
-            HTTP 500, malformed response) -- those are real failures, not
-            routine rate-limiting, and must propagate.
+        BihrApiError: for any BIHR API failure from either client call that
+            is *not* a 429 (e.g. HTTP 500, malformed response) -- those are
+            real failures, not routine rate-limiting, and must propagate.
+        Exception: anything else raised while building the upsert (notably
+            `ValueError` from `catalog_parse.normalize_price` on a
+            malformed price record, but also any DB error on flush/commit)
+            propagates too, via the same rollback-then-raise path used by
+            `catalog_sync.sync_catalog` -- only a 429 is special-cased into
+            `RATE_LIMITED`; every other failure mode here is a real error
+            a Task 8 caller must be prepared to catch (or let crash loudly)
+            rather than assume is always `BihrApiError`.
     """
     brand = session.get(Brand, brand_code)
     if brand is None:
@@ -124,7 +132,9 @@ def refresh_active_brand(session: Session, client: Any, brand_code: str) -> Sync
     try:
         prices = _call_with_rate_limit_retry(client.prices_for_parts, part_numbers)
     except _RateLimited:
-        session.rollback()
+        # No rollback needed here: the upsert loop (Price rows,
+        # Product.supplier_part_number) runs strictly after this point, so
+        # nothing has been added to the session yet at a 429 on this call.
         sync_run = SyncRun(
             run_id=run_id,
             catalog_type="Prices",
