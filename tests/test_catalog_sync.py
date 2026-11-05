@@ -303,3 +303,54 @@ def test_sync_catalog_stocks_unwraps_real_response_shape(db_session):
     run = sync_catalog(db_session, StocksClient(), "Stocks", mode="full")
     assert run.rows_new == 1
     assert db_session.get(Stock, "1000000").value == 11
+
+
+def test_sync_catalog_dedupes_repeated_part_number_within_one_download(db_session):
+    """BIHR can repeat a PartNumber within a single catalog download (the
+    BihrClient docstring for part_numbers_for_brand notes this happens across
+    page boundaries for the per-brand endpoint; this test proves the bulk
+    sync path handles the same situation instead of crashing with a
+    duplicate-primary-key DB error or silently inserting two rows).
+
+    Exercises catalog_sync.py's seen_pks/continue dedup branch directly:
+    the same PartNumber appears twice in one Stocks download, with
+    different Value payloads, so a non-deduped implementation would either
+    raise an IntegrityError on the second insert or (if upserting in-loop)
+    end up with the *last* value instead of the documented "first-seen-this
+    -run wins" policy.
+    """
+    from bihr_connector.models import Stock
+
+    class DuplicatePartNumberClient:
+        def request_catalog(self, catalog_type, language="es"):
+            return {"id": "req-1"}
+
+        def wait_catalog(self, request_id, **kwargs):
+            return {"status": "Finished", "catalogFileId": "file-1"}
+
+        def download_catalog_file(self, file_id):
+            return _zip_bytes(
+                [
+                    {"PartNumber": "1000000", "Value": 11},
+                    {"PartNumber": "1000000", "Value": 999},  # duplicate PK, different payload
+                    {"PartNumber": "1000002", "Value": 5},
+                ],
+                filename="Stocks.json",
+                wrapper_key="Stocks",
+            )
+
+    run = sync_catalog(db_session, DuplicatePartNumberClient(), "Stocks", mode="full")
+
+    # Only one row results for the duplicated PartNumber, not two, and no
+    # DB error was raised getting here.
+    assert db_session.query(Stock).filter_by(part_number="1000000").count() == 1
+
+    # Raw count reflects all 3 records read off the wire; unique/new counts
+    # reflect post-dedup reality (2 distinct PartNumbers).
+    assert run.rows_raw == 3
+    assert run.rows_unique == 2
+    assert run.rows_new == 2
+
+    # First-seen-this-run wins: the first occurrence's Value (11), not the
+    # later duplicate's (999).
+    assert db_session.get(Stock, "1000000").value == 11
