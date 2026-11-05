@@ -36,7 +36,18 @@ CatalogType = Literal["Products", "Prices", "Stocks", "SalesCategories"]
 
 class BihrApiError(RuntimeError):
     """Raised for any BIHR V3 API failure: HTTP errors, malformed responses,
-    and catalog generation that ends in Failed/Cancelled/timeout."""
+    and catalog generation that ends in Failed/Cancelled/timeout.
+
+    `status_code` carries the originating HTTP status when known (e.g. 429
+    for rate-limiting), so callers like `scheduler.refresh_active_brand` can
+    distinguish "back off and retry" from any other failure without parsing
+    the message string. `None` when the error didn't originate from an HTTP
+    response (e.g. malformed JSON, missing fields).
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class BihrClient:
@@ -87,7 +98,8 @@ class BihrClient:
         self._last_request_monotonic = time.monotonic()
         if response.status_code >= 400:
             raise BihrApiError(
-                f"BIHR authentication failed HTTP {response.status_code}: {response.text[:800]}"
+                f"BIHR authentication failed HTTP {response.status_code}: {response.text[:800]}",
+                status_code=response.status_code,
             )
         try:
             payload = response.json()
@@ -133,7 +145,8 @@ class BihrClient:
 
         if response.status_code >= 400:
             raise BihrApiError(
-                f"BIHR {method} {path} -> HTTP {response.status_code}: {response.text[:1200]}"
+                f"BIHR {method} {path} -> HTTP {response.status_code}: {response.text[:1200]}",
+                status_code=response.status_code,
             )
         return response
 

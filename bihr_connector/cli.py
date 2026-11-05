@@ -18,6 +18,7 @@ from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_c
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
 from bihr_connector.db import get_session
+from bihr_connector.scheduler import activate_brand
 
 CATALOG_TYPES: tuple[CatalogType, ...] = ("Products", "Prices", "Stocks", "SalesCategories")
 
@@ -120,6 +121,20 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_activate(args: argparse.Namespace) -> int:
+    """Mark a BIHR brand active so future incremental-refresh cycles
+    (Task 8's scheduler loop) pick it up."""
+    with get_session() as session:
+        try:
+            activate_brand(session, args.brand_code)
+        except ValueError as exc:
+            print(f"Error activating brand {args.brand_code!r}: {exc}", file=sys.stderr)
+            return 1
+
+    print(f"Brand {args.brand_code!r} activated")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bihr-connector", description="BIHR API connector CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -150,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print every brand sorted descending by master_product_count",
     )
     match_parser.set_defaults(func=_cmd_match_brands)
+
+    activate_parser = subparsers.add_parser(
+        "activate",
+        help="Mark a BIHR brand active for incremental refresh",
+    )
+    activate_parser.add_argument(
+        "--brand-code",
+        required=True,
+        help="BIHR brand_code to activate (see match-brands --print-report)",
+    )
+    activate_parser.set_defaults(func=_cmd_activate)
 
     return parser
 
