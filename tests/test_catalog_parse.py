@@ -116,6 +116,33 @@ def test_normalize_product_missing_part_number_raises():
         normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
 
 
+def test_normalize_product_accepts_real_bihr_pascalcase_fields():
+    """The real BIHR V3 API (confirmed live 2026-11-05) returns PascalCase
+    keys (PartNumber, BarCode, IsDiscontinued, ...), not the camelCase keys
+    used elsewhere in this test file. normalize_product must handle both."""
+    raw = {
+        "PartNumber": "8000432001",
+        "OldPartNumber": "old-8000432001",
+        "SupplierPartNumber": "177-0010-01",
+        "Title": "Casco ARAI Quantic - Blanco brillante",
+        "BarCode": "4530935603886",
+        "IsDiscontinued": False,
+    }
+    row = normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["part_number"] == "8000432001"
+    assert row["old_part_number"] == "old-8000432001"
+    assert row["supplier_part_number"] == "177-0010-01"
+    assert row["title"] == "Casco ARAI Quantic - Blanco brillante"
+    assert row["bar_code"] == "4530935603886"
+    assert row["is_discontinued"] is False
+
+
+def test_normalize_product_missing_part_number_raises_for_pascalcase_too():
+    raw = {"Title": "No part number here"}
+    with pytest.raises(ValueError):
+        normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
+
+
 # ---------------------------------------------------------------------------
 # normalize_price()
 # ---------------------------------------------------------------------------
@@ -161,6 +188,22 @@ def test_normalize_price_missing_part_number_raises():
     raw = {"dealerPriceExclTaxes": 12.50}
     with pytest.raises(ValueError):
         normalize_price(raw, source_run_id="run1", now=FIXED_NOW)
+
+
+def test_normalize_price_accepts_real_bihr_pascalcase_fields():
+    raw = {
+        "PartNumber": "1116414",
+        "DealerPriceExclTaxes": 12.50,
+        "RecommendedRetailPriceExclTaxes": 25.00,
+        "RecommendedRetailPriceInclTaxes": 30.25,
+        "IsCurrentlyDiscounted": True,
+    }
+    row = normalize_price(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["part_number"] == "1116414"
+    assert row["dealer_price_excl_taxes"] == 12.50
+    assert row["recommended_retail_price_excl_taxes"] == 25.00
+    assert row["recommended_retail_price_incl_taxes"] == 30.25
+    assert row["is_currently_discounted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +271,21 @@ def test_normalize_stock_missing_part_number_raises():
         normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
 
 
+def test_normalize_stock_accepts_real_bihr_pascalcase_fields():
+    """Real BIHR UpdateDateTime values (confirmed live 2026-11-05) have no
+    UTC "Z"/offset marker at all, e.g. "2026-10-31T00:00:00.0000000" — still
+    must parse to a datetime, just a naive one (no tzinfo to attach)."""
+    raw = {
+        "PartNumber": "1000000",
+        "Value": 11,
+        "UpdateDateTime": "2026-10-31T00:00:00.0000000",
+    }
+    row = normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["part_number"] == "1000000"
+    assert row["value"] == 11
+    assert row["update_datetime"] == datetime(2026, 10, 31, 0, 0, 0)
+
+
 # ---------------------------------------------------------------------------
 # normalize_sales_category()
 # ---------------------------------------------------------------------------
@@ -259,6 +317,16 @@ def test_normalize_sales_category_missing_code_raises():
     raw = {"name": "Braking Systems"}
     with pytest.raises(ValueError):
         normalize_sales_category(raw, source_run_id="run1", now=FIXED_NOW)
+
+
+def test_normalize_sales_category_accepts_real_bihr_pascalcase_fields():
+    """The real BIHR SalesCategories catalog (confirmed live 2026-11-05)
+    only returns "Code" and "Name" per entry (no "Path")."""
+    raw = {"Code": "BSBATTERY_SLA_Lithium", "Name": "BS BATTERY : SLA & Lithium"}
+    row = normalize_sales_category(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["code"] == "BSBATTERY_SLA_Lithium"
+    assert row["name"] == "BS BATTERY : SLA & Lithium"
+    assert row["category_key"] == "BSBATTERY_SLA_Lithium"
 
 
 # ---------------------------------------------------------------------------
