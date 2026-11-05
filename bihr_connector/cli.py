@@ -9,8 +9,12 @@ from __future__ import annotations
 import argparse
 import sys
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from bihr_connector.bihr_client import BihrApiError, BihrClient
 from bihr_connector.brand_dictionary import sync_brand_dictionary
+from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_candidates
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
 from bihr_connector.db import get_session
@@ -60,6 +64,48 @@ def _cmd_sync_brands(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_match_brands(args: argparse.Namespace) -> int:
+    """Cross-reference BIHR brands against Reference Inteligencia's Master
+    and upsert the results into brand_match_candidates."""
+    settings = get_settings()
+    if not settings.RI_DATABASE_URL:
+        print(
+            "RI_DATABASE_URL is not set (check your .env) -- the read-only "
+            "role must be provisioned on Reference Inteligencia's database "
+            "first; see Task 6 brief, Step 0",
+            file=sys.stderr,
+        )
+        return 2
+
+    ri_engine = create_engine(settings.RI_DATABASE_URL, echo=False)
+    RiSessionLocal = sessionmaker(bind=ri_engine, expire_on_commit=False)
+    ri_session = RiSessionLocal()
+
+    try:
+        with get_session() as bihr_session:
+            candidates = compute_brand_match(bihr_session, ri_session)
+            upsert_brand_match_candidates(bihr_session, candidates)
+            bihr_session.commit()
+    finally:
+        ri_session.close()
+        ri_engine.dispose()
+
+    if args.print_report:
+        for candidate in sorted(
+            candidates, key=lambda c: c.master_product_count, reverse=True
+        ):
+            print(
+                f"{candidate.brand_code}\t"
+                f"{candidate.matched_manufacturer_name or '(no match)'}\t"
+                f"master_product_count={candidate.master_product_count}"
+            )
+    else:
+        matched = sum(1 for c in candidates if c.matched_manufacturer_id is not None)
+        print(f"Brand match: {matched}/{len(candidates)} brands matched in Reference Inteligencia")
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bihr-connector", description="BIHR API connector CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -79,6 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-brands", help="Derive brand dictionary from products catalog"
     )
     brands_parser.set_defaults(func=_cmd_sync_brands)
+
+    match_parser = subparsers.add_parser(
+        "match-brands",
+        help="Cross-reference BIHR brands against Reference Inteligencia's Master",
+    )
+    match_parser.add_argument(
+        "--print-report",
+        action="store_true",
+        help="Print every brand sorted descending by master_product_count",
+    )
+    match_parser.set_defaults(func=_cmd_match_brands)
 
     return parser
 
