@@ -3,7 +3,7 @@
 import json
 import hashlib
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 
 def raw_hash(raw: dict) -> str:
@@ -52,6 +52,38 @@ def _get_ci(raw: dict, *keys: str) -> Any:
     return None
 
 
+def _parse_iso_datetime(value: Any) -> "datetime | None":
+    """
+    Parse an ISO-8601 datetime string into a datetime object.
+
+    Handles the trailing "Z" UTC marker, which datetime.fromisoformat()
+    does not accept directly on all supported Python versions.
+
+    Args:
+        value: The raw value (expected to be a string, but tolerates None).
+
+    Returns:
+        A datetime instance, or None if value is absent/unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def normalize_product(raw: dict, source_run_id: str, now: datetime) -> dict:
     """
     Normalize a BIHR product record to match Product ORM columns.
@@ -67,9 +99,12 @@ def normalize_product(raw: dict, source_run_id: str, now: datetime) -> dict:
 
     Returns:
         A dict with keys matching Product ORM columns.
+
+    Raises:
+        ValueError: If the "partNumber" primary-key field is absent.
     """
-    # Core required field
-    part_number = raw.get("partNumber")
+    if raw.get("partNumber") is None:
+        raise ValueError("BIHR record missing PartNumber")
 
     # Map of ORM column name to (raw_key, type_coercer).
     # If raw_key is None, the field is optional and defaults to None.
@@ -78,7 +113,6 @@ def normalize_product(raw: dict, source_run_id: str, now: datetime) -> dict:
         "old_part_number": ("oldPartNumber", str),
         "supplier_part_number": ("supplierPartNumber", str),
         "title": ("title", str),
-        "is_discontinued": ("isDiscontinued", bool),
         "brand_code": ("brandCode", str),
         "brand_name": ("brandName", str),
         "group_code": ("groupCode", str),
@@ -98,6 +132,11 @@ def normalize_product(raw: dict, source_run_id: str, now: datetime) -> dict:
             row[orm_col] = coercer(value) if coercer else value
         else:
             row[orm_col] = None
+
+    # is_discontinued is a non-nullable bool column; absent in the payload
+    # is treated as "not discontinued" (False), never None.
+    is_discontinued = raw.get("isDiscontinued")
+    row["is_discontinued"] = bool(is_discontinued) if is_discontinued is not None else False
 
     # Handle barCode with case-insensitive lookup
     bar_code = _get_ci(raw, "barCode", "Barcode", "barcode")
@@ -126,7 +165,13 @@ def normalize_price(raw: dict, source_run_id: str, now: datetime) -> dict:
 
     Returns:
         A dict with keys matching Price ORM columns.
+
+    Raises:
+        ValueError: If the "partNumber" primary-key field is absent.
     """
+    if raw.get("partNumber") is None:
+        raise ValueError("BIHR record missing PartNumber")
+
     mapping = {
         "part_number": ("partNumber", str),
         "dealer_price_excl_taxes": ("dealerPriceExclTaxes", float),
@@ -169,11 +214,16 @@ def normalize_stock(raw: dict, source_run_id: str, now: datetime) -> dict:
 
     Returns:
         A dict with keys matching Stock ORM columns.
+
+    Raises:
+        ValueError: If the "partNumber" primary-key field is absent.
     """
+    if raw.get("partNumber") is None:
+        raise ValueError("BIHR record missing PartNumber")
+
     mapping = {
         "part_number": ("partNumber", str),
         "forecast_availability": ("forecastAvailability", str),
-        "update_datetime": ("updateDateTime", str),
     }
 
     row = {}
@@ -184,6 +234,10 @@ def normalize_stock(raw: dict, source_run_id: str, now: datetime) -> dict:
             row[orm_col] = coercer(value) if coercer else value
         else:
             row[orm_col] = None
+
+    # update_datetime is a DateTime column; parse the ISO string into a
+    # real datetime object (None if absent or unparseable).
+    row["update_datetime"] = _parse_iso_datetime(raw.get("updateDateTime"))
 
     # Special handling for value: only set if present, never coerce to 0.0
     if "value" in raw:
@@ -214,7 +268,13 @@ def normalize_sales_category(raw: dict, source_run_id: str, now: datetime) -> di
 
     Returns:
         A dict with keys matching SalesCategory ORM columns.
+
+    Raises:
+        ValueError: If the "code" primary-key source field is absent.
     """
+    if raw.get("code") is None:
+        raise ValueError("BIHR record missing code")
+
     mapping = {
         "code": ("code", str),
         "name": ("name", str),

@@ -98,6 +98,24 @@ def test_normalize_product_is_present_defaults_to_true():
     assert row["is_present"] is True
 
 
+def test_normalize_product_is_discontinued_absent_defaults_to_false():
+    raw = {"partNumber": "1116414"}
+    row = normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["is_discontinued"] is False
+
+
+def test_normalize_product_is_discontinued_true_preserved():
+    raw = {"partNumber": "1116414", "isDiscontinued": True}
+    row = normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["is_discontinued"] is True
+
+
+def test_normalize_product_missing_part_number_raises():
+    raw = {"title": "No part number here"}
+    with pytest.raises(ValueError):
+        normalize_product(raw, source_run_id="run1", now=FIXED_NOW)
+
+
 # ---------------------------------------------------------------------------
 # normalize_price()
 # ---------------------------------------------------------------------------
@@ -139,6 +157,12 @@ def test_normalize_price_raw_hash_and_json():
     assert row["last_changed_at"] == FIXED_NOW
 
 
+def test_normalize_price_missing_part_number_raises():
+    raw = {"dealerPriceExclTaxes": 12.50}
+    with pytest.raises(ValueError):
+        normalize_price(raw, source_run_id="run1", now=FIXED_NOW)
+
+
 # ---------------------------------------------------------------------------
 # normalize_stock()
 # ---------------------------------------------------------------------------
@@ -167,7 +191,7 @@ def test_normalize_stock_all_fields():
     assert row["part_number"] == "1048790"
     assert row["value"] == 42.5
     assert row["forecast_availability"] == "2026-12-01"
-    assert row["update_datetime"] == "2026-11-05T10:30:00Z"
+    assert row["update_datetime"] == datetime(2026, 11, 5, 10, 30, 0, tzinfo=timezone.utc)
 
 
 def test_normalize_stock_raw_hash_and_json():
@@ -177,6 +201,31 @@ def test_normalize_stock_raw_hash_and_json():
     assert "raw_json" in row
     assert row["source_run_id"] == "run1"
     assert row["is_present"] is True
+
+
+def test_normalize_stock_update_datetime_is_datetime_instance_with_z_suffix():
+    raw = {"partNumber": "1048790", "updateDateTime": "2026-11-05T10:30:00Z"}
+    row = normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
+    assert isinstance(row["update_datetime"], datetime)
+    assert row["update_datetime"] == datetime(2026, 11, 5, 10, 30, 0, tzinfo=timezone.utc)
+
+
+def test_normalize_stock_update_datetime_absent_is_none():
+    raw = {"partNumber": "1048790"}
+    row = normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["update_datetime"] is None
+
+
+def test_normalize_stock_update_datetime_unparseable_is_none():
+    raw = {"partNumber": "1048790", "updateDateTime": "not-a-date"}
+    row = normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
+    assert row["update_datetime"] is None
+
+
+def test_normalize_stock_missing_part_number_raises():
+    raw = {"value": 42.5}
+    with pytest.raises(ValueError):
+        normalize_stock(raw, source_run_id="run1", now=FIXED_NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +253,12 @@ def test_normalize_sales_category_optional_fields():
     assert row["code"] == "BRAKES"
     assert row["name"] is None
     assert row["path"] is None
+
+
+def test_normalize_sales_category_missing_code_raises():
+    raw = {"name": "Braking Systems"}
+    with pytest.raises(ValueError):
+        normalize_sales_category(raw, source_run_id="run1", now=FIXED_NOW)
 
 
 # ---------------------------------------------------------------------------
