@@ -1,7 +1,8 @@
 """Cross-reference BIHR brands against Reference Inteligencia's Master.
 
 Reference Inteligencia ("RI") is a separate, already-existing production
-application outside this repo. We only know three of its tables:
+application outside this repo. The brief (ADR 0005) lists four of its
+tables under the ``ri`` schema, three of which this module queries:
 
 - ``core_manufacturers(id, name)``
 - ``source_brand_labels(brand_code, manufacturer_id)`` -- the alias table
@@ -10,6 +11,12 @@ application outside this repo. We only know three of its tables:
   stay consistent with the rest of the codebase's identity rules.
 - ``master_products(manufacturer_id)`` -- counted per manufacturer to show
   how much RI coverage a brand already has.
+
+The fourth table in the brief, ``source_brand_coverage``, is deliberately
+*not* queried here: it plays no role in name-to-manufacturer resolution,
+it's only present in the Step 0 grant list (the read-only role needs
+SELECT on it for some other RI-side consumer), so this function has no
+query dependency on it.
 
 ``compute_brand_match`` takes two SQLAlchemy ``Session`` objects and is
 deliberately agnostic about whether they point at the same database or two
@@ -24,6 +31,31 @@ from sqlalchemy import MetaData, Table, func, select
 from sqlalchemy.orm import Session
 
 from bihr_connector.models import Brand, BrandMatchCandidate
+
+
+class AmbiguousBrandAliasError(Exception):
+    """Raised when a brand_code resolves to more than one distinct
+    manufacturer_id in RI's source_brand_labels.
+
+    The brief's own identity rule is "exact alias lookup only, never
+    fuzzy" -- silently picking one of several conflicting alias rows would
+    undercut that guarantee by making the result depend on arbitrary row
+    order. We have no verified column on the real source_brand_labels
+    table (e.g. a created/updated timestamp) to justify a deterministic
+    tie-break via ORDER BY, so ambiguity is surfaced loudly instead of
+    silently resolved. Whoever owns the RI alias data decides the real fix
+    (dedupe the aliases, or add a tie-break column) -- this function will
+    not guess.
+    """
+
+    def __init__(self, brand_code: str, manufacturer_ids: list[int]) -> None:
+        self.brand_code = brand_code
+        self.manufacturer_ids = manufacturer_ids
+        super().__init__(
+            f"brand_code {brand_code!r} has {len(manufacturer_ids)} distinct "
+            f"manufacturer_id aliases in source_brand_labels: {manufacturer_ids} "
+            "-- ambiguous, refusing to silently pick one"
+        )
 
 
 def _ri_table(ri_session: Session, name: str, columns: tuple[str, ...]) -> Table:
@@ -54,6 +86,10 @@ def compute_brand_match(
     ``matched_manufacturer_id=None`` and ``master_product_count=0`` --
     never dropped, never raised as an error.
 
+    Brands whose brand_code aliases more than one distinct
+    manufacturer_id raise ``AmbiguousBrandAliasError`` instead of silently
+    picking one -- see that class's docstring for why.
+
     This function only reads; it does not add the returned candidates to
     any session or commit anything. Callers decide how to persist them.
     """
@@ -69,18 +105,26 @@ def compute_brand_match(
     candidates: list[BrandMatchCandidate] = []
 
     for brand_code in brands:
-        alias_row = ri_session.execute(
-            select(source_brand_labels.c.manufacturer_id).where(
-                source_brand_labels.c.brand_code == brand_code
-            )
-        ).first()
+        alias_manufacturer_ids = sorted(
+            {
+                row[0]
+                for row in ri_session.execute(
+                    select(source_brand_labels.c.manufacturer_id).where(
+                        source_brand_labels.c.brand_code == brand_code
+                    )
+                ).all()
+            }
+        )
+
+        if len(alias_manufacturer_ids) > 1:
+            raise AmbiguousBrandAliasError(brand_code, alias_manufacturer_ids)
 
         matched_manufacturer_id: int | None = None
         matched_manufacturer_name: str | None = None
         master_product_count = 0
 
-        if alias_row is not None:
-            manufacturer_id = alias_row[0]
+        if alias_manufacturer_ids:
+            manufacturer_id = alias_manufacturer_ids[0]
             manufacturer_row = ri_session.execute(
                 select(core_manufacturers.c.name).where(
                     core_manufacturers.c.id == manufacturer_id

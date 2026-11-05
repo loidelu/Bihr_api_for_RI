@@ -16,7 +16,11 @@ import pytest
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_candidates
+from bihr_connector.brand_match import (
+    AmbiguousBrandAliasError,
+    compute_brand_match,
+    upsert_brand_match_candidates,
+)
 from bihr_connector.models import Brand, BrandMatchCandidate
 
 # --- Minimal stand-in RI schema (test-only, not the real RI ORM) ---------
@@ -142,6 +146,43 @@ def test_compute_brand_match_covers_every_brand_row(db_session, ri_session):
     candidates = compute_brand_match(db_session, ri_session)
 
     assert {c.brand_code for c in candidates} == {"1063", "9999"}
+
+
+def test_compute_brand_match_raises_on_ambiguous_alias(db_session, ri_session):
+    """A brand_code aliased to two *different* manufacturer_ids in
+    source_brand_labels is a real conflict (e.g. a historical rename that
+    wasn't cleaned up on the RI side) -- compute_brand_match must raise
+    AmbiguousBrandAliasError rather than silently picking one row."""
+    _seed_bihr_brand(db_session, brand_code="3001", brand_name="DOUBLE-ALIASED")
+    _seed_ri_manufacturer(ri_session, id=10, name="MANUFACTURER-A", brand_code="3001")
+    _seed_ri_manufacturer(ri_session, id=11, name="MANUFACTURER-B", brand_code="3001")
+
+    with pytest.raises(AmbiguousBrandAliasError) as exc_info:
+        compute_brand_match(db_session, ri_session)
+
+    assert exc_info.value.brand_code == "3001"
+    assert exc_info.value.manufacturer_ids == [10, 11]
+
+
+def test_compute_brand_match_duplicate_alias_rows_same_manufacturer_is_not_ambiguous(
+    db_session, ri_session
+):
+    """Two source_brand_labels rows for the same brand_code that both point
+    at the *same* manufacturer_id are a harmless duplicate, not a conflict
+    -- must match normally, not raise."""
+    _seed_bihr_brand(db_session, brand_code="3002", brand_name="DUPLICATE-ALIAS-ROWS")
+    _seed_ri_manufacturer(ri_session, id=20, name="SAME-MANUFACTURER", master_product_count=4, brand_code="3002")
+    # A second alias row, same brand_code, same manufacturer_id.
+    ri_session.execute(
+        source_brand_labels.insert().values(brand_code="3002", manufacturer_id=20)
+    )
+    ri_session.flush()
+
+    candidates = compute_brand_match(db_session, ri_session)
+
+    row = next(c for c in candidates if c.brand_code == "3002")
+    assert row.matched_manufacturer_id == 20
+    assert row.master_product_count == 4
 
 
 def test_upsert_brand_match_candidates_inserts_new_rows(db_session, ri_session):
