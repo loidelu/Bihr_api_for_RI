@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bihr-connector"
+version = "0.1.0"
+description = "BIHR API connector for Reference Inteligencia — downloads product/price/stock catalog and stores in Postgres"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "Loïc Demazieres", email = "loic.demazieres@totimport.com"}]
+
+dependencies = [
+    "sqlalchemy>=2.0,<3",
+    "psycopg[binary]>=3.2,<4",
+    "alembic>=1.14,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.scripts]
+bihr-connector = "bihr_connector.cli:main"
+
+[tool.setuptools]
+packages = ["bihr_connector"]
