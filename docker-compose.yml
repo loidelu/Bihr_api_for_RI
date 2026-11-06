@@ -15,4 +15,7 @@ services:
       resources:
         limits:
           cpus: "1"
-          memory: 512M
+          # The full Products catalog (~180k rows, ~474 MB uncompressed JSON)
+          # held in memory alongside the existing-rows ORM query needs real
+          # headroom -- 512M OOM-killed mid-sync on first real deploy (2026-11-06).
+          memory: 2048M
