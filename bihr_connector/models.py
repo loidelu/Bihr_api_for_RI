@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, Boolean, DateTime, Text, Float, Integer
+from sqlalchemy import String, Boolean, DateTime, Text, Float, Integer, JSON
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 
 Base = declarative_base()
@@ -157,3 +157,25 @@ class BrandMatchCandidate(Base):
     matched_manufacturer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     master_product_count: Mapped[int] = mapped_column(Integer, default=0)
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ConnectorStatus(Base):
+    """Single-row-per-connector sync health snapshot.
+
+    Written by this connector only (see connector_status.py's recorder
+    helpers). A separate project, connectors-hub (a different repo),
+    will later read this table read-only to show sync health on a
+    dashboard -- that consumer has no bearing on this model's shape.
+    """
+
+    __tablename__ = "connector_status"
+
+    connector_name: Mapped[str] = mapped_column(String(50), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    scheduler_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    brands_total: Mapped[int] = mapped_column(Integer, default=0)
+    brands_active: Mapped[int] = mapped_column(Integer, default=0)
+    brand_match_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    last_incremental_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    catalogs: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
