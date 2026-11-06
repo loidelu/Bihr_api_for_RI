@@ -29,6 +29,12 @@ class Settings:
     # preflight ruling: deliberately stricter than the bulk catalog
     # cadences (Stocks' 6h is the tightest) but not unbounded -- default 2h.
     INCREMENTAL_REFRESH_HOURS: int = int(os.environ.get("INCREMENTAL_REFRESH_HOURS", "2"))
+    # Shared secret the internal HTTP API (api.py) requires on the
+    # `X-Hub-Token` header for every protected endpoint. Empty by default --
+    # api.py's auth dependency must never authorize a request against an
+    # empty/unset token, so leaving this unset effectively locks every
+    # protected endpoint. Never log this value.
+    HUB_API_TOKEN: str = os.environ.get("HUB_API_TOKEN", "")
 
 
 def get_settings() -> Settings:
