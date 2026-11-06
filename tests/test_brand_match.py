@@ -21,6 +21,13 @@ manufacturer_id)`, where `label` is the brand-name text that
 brand_code, and not scoped by source_system (label spellings are shared
 across every source RI already ingests, which is what lets this match
 brands today even though BIHR has no source_system of its own yet).
+
+A second wrong guess slipped past this same fix: `master_products` was
+assumed to use `manufacturer_id` (matching `source_brand_labels`'s
+column name) when the real foreign key column is `brand_id`
+(`fk_master_products_brand` -> `core_manufacturers.id`). Caught the same
+way -- a live run against production, not by these tests, since the
+stand-in table below mirrored the same wrong guess. Fixed here too.
 """
 
 import os
@@ -72,7 +79,7 @@ master_products = Table(
     "master_products",
     ri_metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("manufacturer_id", Integer, nullable=False),
+    Column("brand_id", Integer, nullable=False),
 )
 
 
@@ -136,7 +143,7 @@ def _seed_ri_manufacturer(
         )
     )
     for _ in range(master_product_count):
-        ri_session.execute(master_products.insert().values(manufacturer_id=id))
+        ri_session.execute(master_products.insert().values(brand_id=id))
     ri_session.flush()
 
 
@@ -326,7 +333,7 @@ def test_upsert_brand_match_candidates_updates_in_place_on_rerun(db_session, ri_
     upsert_brand_match_candidates(db_session, first)
 
     # Simulate RI's coverage growing before the next run.
-    ri_session.execute(master_products.insert().values(manufacturer_id=42))
+    ri_session.execute(master_products.insert().values(brand_id=42))
     ri_session.flush()
 
     second, _ambiguous2 = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)

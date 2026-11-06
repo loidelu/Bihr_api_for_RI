@@ -21,16 +21,23 @@ earlier assumed shape turned out wrong -- see below) is:
   than a BIHR-specific code means this works today even though BIHR has
   no ``source_system`` of its own registered in RI yet -- ``label``
   values are shared brand-name spellings, not source-scoped codes.
-- ``master_products(manufacturer_id)`` -- counted per manufacturer to show
-  how much RI coverage a brand already has.
+- ``master_products(brand_id)`` -- a foreign key to
+  ``core_manufacturers.id`` (``fk_master_products_brand``), counted per
+  manufacturer to show how much RI coverage a brand already has. Despite
+  the name, this is NOT called ``manufacturer_id`` on this table.
 
-An earlier version of this module assumed ``core_manufacturers(id, name)``
-and ``source_brand_labels(brand_code, manufacturer_id)`` -- a plausible
-guess from the design brief that was never checked against the real
-database, and the test suite's throwaway stand-in schema mirrored the
-same wrong guess instead of the real one, so nothing caught it until the
-first live run against production RI raised ``ValueError: RI table
-'core_manufacturers' is missing expected column(s): ['name']``.
+Two separate wrong guesses have been made and fixed here, both caught
+only by a live run against production, never by local tests (whose
+stand-in schema mirrored whichever guess was current):
+1. An earlier version assumed ``core_manufacturers(id, name)`` and
+   ``source_brand_labels(brand_code, manufacturer_id)``, which crashed
+   with ``ValueError: RI table 'core_manufacturers' is missing expected
+   column(s): ['name']``.
+2. After fixing (1), a second guess assumed ``master_products`` used
+   ``manufacturer_id`` (matching the column name on
+   ``source_brand_labels``) when it actually uses ``brand_id`` --
+   crashed with ``ValueError: RI table 'master_products' is missing
+   expected column(s): ['manufacturer_id']``.
 
 The fourth table in the brief, ``source_brand_coverage``, is deliberately
 *not* queried here: it plays no role in name-to-manufacturer resolution,
@@ -137,7 +144,7 @@ def compute_brand_match(
     source_brand_labels = _ri_table(
         ri_session, "source_brand_labels", ("label", "manufacturer_id"), schema
     )
-    master_products = _ri_table(ri_session, "master_products", ("manufacturer_id",), schema)
+    master_products = _ri_table(ri_session, "master_products", ("brand_id",), schema)
 
     brands = bihr_session.execute(select(Brand.brand_code, Brand.brand_name)).all()
 
@@ -275,7 +282,7 @@ def find_possible_matches(
 def _count_master_products(ri_session: Session, master_products: Table, manufacturer_id: int) -> int:
     return ri_session.execute(
         select(func.count()).select_from(master_products).where(
-            master_products.c.manufacturer_id == manufacturer_id
+            master_products.c.brand_id == manufacturer_id
         )
     ).scalar_one()
 
