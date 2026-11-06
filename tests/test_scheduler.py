@@ -710,6 +710,63 @@ def test_run_cycle_records_catalog_failure(db_session):
     assert status.catalogs["Products"]["consecutive_failures"] == 1
 
 
+def test_run_cycle_records_catalog_rate_limited_not_failed(db_session):
+    """A 429 from any of the bulk-catalog request/wait/download calls is
+    routine rate-limiting (High-severity final-review finding), not a
+    genuine failure -- it must land as status="RATE_LIMITED" and must NOT
+    increment consecutive_failures, starting from a clean slate (0 stays 0)."""
+
+    class OneCatalogRateLimitedClient(FakeFullCycleBihrClient):
+        def download_catalog_file(self, file_id):
+            catalog_type = self.requested_catalog_types[-1]
+            if catalog_type == "Products":
+                raise BihrApiError("HTTP 429: rate limited", status_code=429)
+            return super().download_catalog_file(file_id)
+
+    client = OneCatalogRateLimitedClient()
+
+    run_cycle(db_session, client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.catalogs["Products"]["status"] == "RATE_LIMITED"
+    assert status.catalogs["Products"]["consecutive_failures"] == 0
+
+
+def test_run_cycle_rate_limited_catalog_does_not_reset_prior_consecutive_failures(db_session):
+    """The semantics are "unchanged", not "reset to 0": a catalog that
+    already had real prior failures (consecutive_failures > 0) and then
+    gets rate-limited must keep that same nonzero count, not have it reset
+    nor incremented -- this is what actually matters for the
+    connectors-hub Telegram paging threshold."""
+
+    class OneCatalogRateLimitedClient(FakeFullCycleBihrClient):
+        def download_catalog_file(self, file_id):
+            catalog_type = self.requested_catalog_types[-1]
+            if catalog_type == "Products":
+                raise BihrApiError("HTTP 429: rate limited", status_code=429)
+            return super().download_catalog_file(file_id)
+
+    client = OneCatalogRateLimitedClient()
+
+    # Seed a prior genuine failure so consecutive_failures starts nonzero.
+    from bihr_connector import connector_status as connector_status_module
+
+    connector_status_module.record_catalog_result(
+        db_session, "Products", succeeded=False, now=FIXED_NOW - timedelta(hours=1), rate_limited=False
+    )
+    db_session.expire_all()
+    status_before = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status_before.catalogs["Products"]["consecutive_failures"] == 1
+
+    run_cycle(db_session, client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.catalogs["Products"]["status"] == "RATE_LIMITED"
+    assert status.catalogs["Products"]["consecutive_failures"] == 1
+
+
 def test_run_cycle_records_incremental_success(db_session, fake_full_cycle_client):
     _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
 

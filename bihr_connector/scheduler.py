@@ -439,11 +439,24 @@ def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
             continue
         try:
             run = sync_catalog(session, client, catalog_type, mode="full")
+        except BihrApiError as exc:
+            logger.exception("run_cycle: sync_catalog failed for catalog_type=%s", catalog_type)
+            # sync_catalog has no rate-limit handling of its own, so a 429
+            # from any of the bulk-catalog request/wait/download calls
+            # propagates here as a BihrApiError -- that is routine
+            # rate-limiting, not a genuine failure, so it must not bump
+            # consecutive_failures. Any other BihrApiError (e.g. HTTP 500)
+            # is a real failure and keeps rate_limited=False.
+            connector_status.record_catalog_result(
+                session,
+                catalog_type,
+                succeeded=False,
+                now=now,
+                rate_limited=exc.status_code == RATE_LIMIT_STATUS_CODE,
+            )
+            continue
         except Exception:
             logger.exception("run_cycle: sync_catalog failed for catalog_type=%s", catalog_type)
-            # A hard sync_catalog exception is never a 429 rate-limit case
-            # in this codebase's design (catalog_sync has no rate-limit
-            # handling of its own) -- rate_limited is always False here.
             connector_status.record_catalog_result(
                 session, catalog_type, succeeded=False, now=now, rate_limited=False
             )
