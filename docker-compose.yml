@@ -1,6 +1,18 @@
+networks:
+  datahub:
+    external: true
+
 services:
   bihr-connector:
     build: .
     env_file:
       - .env
+    networks:
+      - default
+      - datahub
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
