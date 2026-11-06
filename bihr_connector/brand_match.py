@@ -263,6 +263,7 @@ def find_possible_matches(
     ).all()
 
     hints: list[PossibleMatch] = []
+    seen: set[tuple[str, int, str]] = set()
     for brand_code, brand_name in brand_names.items():
         if not brand_name:
             continue
@@ -273,8 +274,17 @@ def find_possible_matches(
             haystack = label.strip().upper()
             if haystack == needle:
                 continue  # exact matches are compute_brand_match's job, not a "hint"
-            if needle in haystack or haystack in needle:
-                hints.append(PossibleMatch(brand_code, manufacturer_id, manufacturer_name, label))
+            if needle not in haystack and haystack not in needle:
+                continue
+            # source_brand_labels has one row per (source_system, source_code),
+            # so the same label spelling for the same manufacturer can appear
+            # several times (e.g. once per source RI already ingests) -- collapse
+            # those into a single hint instead of repeating it verbatim.
+            dedupe_key = (brand_code, manufacturer_id, haystack)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            hints.append(PossibleMatch(brand_code, manufacturer_id, manufacturer_name, label))
 
     return hints
 

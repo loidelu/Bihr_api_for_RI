@@ -412,3 +412,30 @@ def test_find_possible_matches_never_raises_and_returns_empty_when_nothing_unmat
     candidates: list[BrandMatchCandidate] = []
     hints = find_possible_matches(db_session, ri_session, candidates, ri_schema=RI_TEST_SCHEMA)
     assert hints == []
+
+
+def test_find_possible_matches_dedupes_repeated_label_across_source_systems(
+    db_session, ri_session
+):
+    """source_brand_labels has one row per (source_system, source_code), so
+    the real RI data has the same label spelling registered several times
+    for one manufacturer (once per source RI already ingests). That must
+    collapse into a single hint, not one per underlying row."""
+    _seed_bihr_brand(db_session, brand_code="4003", brand_name="GOODRIDGE")
+    _seed_ri_manufacturer(ri_session, id=91, name="Goodridge", label="GOODRIDGE BRAKES")
+    # Two more rows, same manufacturer, same label spelling -- simulating
+    # extra source_system registrations (e.g. a3_car3, prestashop).
+    ri_session.execute(
+        source_brand_labels.insert().values(label="GOODRIDGE BRAKES", manufacturer_id=91)
+    )
+    ri_session.execute(
+        source_brand_labels.insert().values(label="GOODRIDGE BRAKES", manufacturer_id=91)
+    )
+    ri_session.flush()
+
+    candidates, _ambiguous = compute_brand_match(db_session, ri_session, ri_schema=RI_TEST_SCHEMA)
+    hints = find_possible_matches(db_session, ri_session, candidates, ri_schema=RI_TEST_SCHEMA)
+
+    assert len(hints) == 1
+    assert hints[0].brand_code == "4003"
+    assert hints[0].manufacturer_id == 91
