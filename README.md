@@ -228,10 +228,13 @@ docker compose run --rm bihr-connector python -m bihr_connector.cli run-schedule
 docker compose run --rm bihr-connector python -m bihr_connector.cli match-brands --print-report
 ```
 
-The `docker-compose.yml` includes:
-- Automatic restart (`unless-stopped`) if the container crashes
-- `.env` file auto-loading for credentials and URLs
-- Log visibility via `docker compose logs`
+The `docker-compose.yml` includes two services:
+
+1. **`bihr-connector`**: the scheduler loop (default entrypoint) — runs the catalog sync and brand refresh cycles automatically.
+
+2. **`bihr-connector-api`**: the internal HTTP API — accepts actions from `connectors-hub` (e.g., brand activation/deactivation) and provides connector status. This service is **internal-only** — it listens on port 8000 but is not published outside the Docker network. Only containers connected to the `datahub` network can reach it. Requires the `HUB_API_TOKEN` environment variable (a shared secret for authentication).
+
+Both services auto-restart (`unless-stopped`) on failure, auto-load the `.env` file for credentials and URLs, and are visible via `docker compose logs`.
 
 ## Key Design Decisions
 
