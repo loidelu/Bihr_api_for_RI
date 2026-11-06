@@ -3,15 +3,34 @@
 Reference Inteligencia ("RI") is a separate, already-existing production
 application outside this repo. The brief (ADR 0005) lists four of its
 tables under the ``ri`` schema (configurable via ``settings.RI_SCHEMA``,
-see ``bihr_connector/config.py``), three of which this module queries:
+see ``bihr_connector/config.py``), three of which this module queries.
+The real schema (confirmed against production on 2026-11-06, after an
+earlier assumed shape turned out wrong -- see below) is:
 
-- ``core_manufacturers(id, name)``
-- ``source_brand_labels(brand_code, manufacturer_id)`` -- the alias table
-  mapping a brand name/code variant to a manufacturer. Lookup is always an
-  exact alias match on ``brand_code``, never fuzzy string similarity, to
-  stay consistent with the rest of the codebase's identity rules.
+- ``core_manufacturers(id, canonical_name, active, website, notes,
+  updated_at)``.
+- ``source_brand_labels(id, source_system, source_code, label,
+  manufacturer_id)`` -- the alias table mapping a brand *name* spelling
+  to a manufacturer, shared across every source RI already ingests (e.g.
+  ``source_system='parts_europe'``). ``source_code`` identifies the
+  source's feed, not a per-brand code -- it is NOT what resolves a brand;
+  ``label`` (the brand name text, e.g. ``"BARKBUSTERS"``) is. Lookup is
+  always an exact (case-insensitive) match on ``label`` against BIHR's
+  ``brand_name``, never fuzzy string similarity, to stay consistent with
+  the rest of the codebase's identity rules. Matching by name text rather
+  than a BIHR-specific code means this works today even though BIHR has
+  no ``source_system`` of its own registered in RI yet -- ``label``
+  values are shared brand-name spellings, not source-scoped codes.
 - ``master_products(manufacturer_id)`` -- counted per manufacturer to show
   how much RI coverage a brand already has.
+
+An earlier version of this module assumed ``core_manufacturers(id, name)``
+and ``source_brand_labels(brand_code, manufacturer_id)`` -- a plausible
+guess from the design brief that was never checked against the real
+database, and the test suite's throwaway stand-in schema mirrored the
+same wrong guess instead of the real one, so nothing caught it until the
+first live run against production RI raised ``ValueError: RI table
+'core_manufacturers' is missing expected column(s): ['name']``.
 
 The fourth table in the brief, ``source_brand_coverage``, is deliberately
 *not* queried here: it plays no role in name-to-manufacturer resolution,
@@ -38,10 +57,11 @@ from bihr_connector.models import Brand, BrandMatchCandidate
 
 @dataclass(frozen=True)
 class AmbiguousBrandAlias:
-    """One brand_code that aliases more than one distinct manufacturer_id
-    in RI's source_brand_labels -- a data-quality conflict on the RI side
-    (e.g. an uncleaned historical rename), not something this connector
-    can resolve on its own.
+    """One BIHR brand whose ``brand_name`` matches ``label`` rows pointing
+    at more than one distinct ``manufacturer_id`` in RI's
+    source_brand_labels -- a data-quality conflict on the RI side (e.g. an
+    uncleaned historical rename), not something this connector can
+    resolve on its own.
 
     The brief's own identity rule is "exact alias lookup only, never
     fuzzy" -- silently picking one of several conflicting alias rows would
@@ -86,10 +106,10 @@ def compute_brand_match(
     bihr_session: Session, ri_session: Session, ri_schema: str | None = None
 ) -> tuple[list[BrandMatchCandidate], list[AmbiguousBrandAlias]]:
     """For every row in ``brands``, look up a matching RI manufacturer by
-    exact alias (via ``source_brand_labels.brand_code``), count
-    ``master_products`` rows for that manufacturer, and return one
-    ``BrandMatchCandidate`` per brand, plus a separate list flagging any
-    brand whose alias was ambiguous.
+    exact (case-insensitive) match of ``brand_name`` against
+    ``source_brand_labels.label``, count ``master_products`` rows for
+    that manufacturer, and return one ``BrandMatchCandidate`` per brand,
+    plus a separate list flagging any brand whose label was ambiguous.
 
     Brands with no matching alias (or an ambiguous one -- see below) are
     reported with ``matched_manufacturer_id=None`` and
@@ -113,25 +133,25 @@ def compute_brand_match(
     any session or commit anything. Callers decide how to persist them.
     """
     schema = ri_schema if ri_schema is not None else get_settings().RI_SCHEMA
-    core_manufacturers = _ri_table(ri_session, "core_manufacturers", ("id", "name"), schema)
+    core_manufacturers = _ri_table(ri_session, "core_manufacturers", ("id", "canonical_name"), schema)
     source_brand_labels = _ri_table(
-        ri_session, "source_brand_labels", ("brand_code", "manufacturer_id"), schema
+        ri_session, "source_brand_labels", ("label", "manufacturer_id"), schema
     )
     master_products = _ri_table(ri_session, "master_products", ("manufacturer_id",), schema)
 
-    brands = bihr_session.execute(select(Brand.brand_code)).scalars().all()
+    brands = bihr_session.execute(select(Brand.brand_code, Brand.brand_name)).all()
 
     now = datetime.now(timezone.utc)
     candidates: list[BrandMatchCandidate] = []
     ambiguous: list[AmbiguousBrandAlias] = []
 
-    for brand_code in brands:
+    for brand_code, brand_name in brands:
         alias_manufacturer_ids = sorted(
             {
                 row[0]
                 for row in ri_session.execute(
                     select(source_brand_labels.c.manufacturer_id).where(
-                        source_brand_labels.c.brand_code == brand_code
+                        func.upper(source_brand_labels.c.label) == func.upper(brand_name)
                     )
                 ).all()
             }
@@ -146,7 +166,7 @@ def compute_brand_match(
         elif alias_manufacturer_ids:
             manufacturer_id = alias_manufacturer_ids[0]
             manufacturer_row = ri_session.execute(
-                select(core_manufacturers.c.name).where(
+                select(core_manufacturers.c.canonical_name).where(
                     core_manufacturers.c.id == manufacturer_id
                 )
             ).first()
@@ -168,6 +188,88 @@ def compute_brand_match(
         )
 
     return candidates, ambiguous
+
+
+@dataclass(frozen=True)
+class PossibleMatch:
+    """A non-exact textual hint for a BIHR brand that has no exact
+    ``label`` match -- e.g. BIHR's "GILLES" vs RI's label "GILLES
+    TOOLING", or "FRENKIT" vs "FRENKIT S.L.". These are real, legitimate
+    brand-name variants that an exact match deliberately does not resolve
+    (per this module's "never fuzzy" rule) -- surfacing them here is
+    purely to save a human from re-reading all unmatched brand names by
+    hand; it is never auto-selected, never written to
+    BrandMatchCandidate, and never counts as a decided match.
+
+    The only heuristic used is case-insensitive substring containment
+    (one name is fully contained in the other) -- not edit-distance or
+    any scored fuzzy similarity. Containment is a narrow, auditable
+    signal: a human reading "GILLES" / "GILLES TOOLING" side by side can
+    immediately see why it was suggested, which a similarity score alone
+    would not make obvious.
+    """
+
+    brand_code: str
+    manufacturer_id: int
+    manufacturer_name: str
+    label: str
+
+
+def find_possible_matches(
+    bihr_session: Session,
+    ri_session: Session,
+    candidates: list[BrandMatchCandidate],
+    ri_schema: str | None = None,
+) -> list[PossibleMatch]:
+    """For every brand in ``candidates`` with no exact match
+    (``matched_manufacturer_id is None``), look for RI labels that
+    case-insensitively contain the brand's name or vice versa, and return
+    one ``PossibleMatch`` per (brand, label) hit.
+
+    Purely informational -- see ``PossibleMatch`` -- and purely additive
+    on top of ``compute_brand_match``: it never changes which brands
+    count as matched, never raises on ambiguity (multiple hints for the
+    same brand are all returned), and this function itself never writes
+    anything to any session.
+    """
+    schema = ri_schema if ri_schema is not None else get_settings().RI_SCHEMA
+    core_manufacturers = _ri_table(ri_session, "core_manufacturers", ("id", "canonical_name"), schema)
+    source_brand_labels = _ri_table(
+        ri_session, "source_brand_labels", ("label", "manufacturer_id"), schema
+    )
+
+    unmatched = {c.brand_code: c for c in candidates if c.matched_manufacturer_id is None}
+    if not unmatched:
+        return []
+
+    brand_names = {
+        row[0]: row[1]
+        for row in bihr_session.execute(
+            select(Brand.brand_code, Brand.brand_name).where(Brand.brand_code.in_(unmatched))
+        ).all()
+    }
+
+    all_labels = ri_session.execute(
+        select(source_brand_labels.c.label, source_brand_labels.c.manufacturer_id, core_manufacturers.c.canonical_name)
+        .select_from(source_brand_labels)
+        .join(core_manufacturers, core_manufacturers.c.id == source_brand_labels.c.manufacturer_id)
+    ).all()
+
+    hints: list[PossibleMatch] = []
+    for brand_code, brand_name in brand_names.items():
+        if not brand_name:
+            continue
+        needle = brand_name.strip().upper()
+        for label, manufacturer_id, manufacturer_name in all_labels:
+            if not label:
+                continue
+            haystack = label.strip().upper()
+            if haystack == needle:
+                continue  # exact matches are compute_brand_match's job, not a "hint"
+            if needle in haystack or haystack in needle:
+                hints.append(PossibleMatch(brand_code, manufacturer_id, manufacturer_name, label))
+
+    return hints
 
 
 def _count_master_products(ri_session: Session, master_products: Table, manufacturer_id: int) -> int:

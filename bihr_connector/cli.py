@@ -15,7 +15,11 @@ from sqlalchemy.orm import sessionmaker
 
 from bihr_connector.bihr_client import BihrApiError, BihrClient
 from bihr_connector.brand_dictionary import sync_brand_dictionary
-from bihr_connector.brand_match import compute_brand_match, upsert_brand_match_candidates
+from bihr_connector.brand_match import (
+    compute_brand_match,
+    find_possible_matches,
+    upsert_brand_match_candidates,
+)
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
 from bihr_connector.db import get_session
@@ -88,9 +92,17 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
             candidates, ambiguous = compute_brand_match(bihr_session, ri_session)
             upsert_brand_match_candidates(bihr_session, candidates)
             bihr_session.commit()
+            # Read-only and purely informational -- never persisted, never
+            # changes which brands count as matched. See PossibleMatch's
+            # docstring: exact-match stays the only thing that's "decided".
+            hints = find_possible_matches(bihr_session, ri_session, candidates)
     finally:
         ri_session.close()
         ri_engine.dispose()
+
+    hints_by_brand: dict[str, list] = {}
+    for hint in hints:
+        hints_by_brand.setdefault(hint.brand_code, []).append(hint)
 
     if args.print_report:
         for candidate in sorted(
@@ -101,9 +113,13 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
                 f"{candidate.matched_manufacturer_name or '(no match)'}\t"
                 f"master_product_count={candidate.master_product_count}"
             )
+            for hint in hints_by_brand.get(candidate.brand_code, []):
+                print(f"\tposible: '{hint.label}' -> {hint.manufacturer_name} (id={hint.manufacturer_id})")
     else:
         matched = sum(1 for c in candidates if c.matched_manufacturer_id is not None)
         print(f"Brand match: {matched}/{len(candidates)} brands matched in Reference Inteligencia")
+        if hints_by_brand:
+            print(f"  + {len(hints_by_brand)} unmatched brand(s) have a possible name-variant hint (--print-report to see them)")
 
     if ambiguous:
         print(
