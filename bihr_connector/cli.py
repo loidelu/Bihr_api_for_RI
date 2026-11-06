@@ -22,6 +22,7 @@ from bihr_connector.brand_match import (
 )
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
 from bihr_connector.config import get_settings
+from bihr_connector.connector_status import record_brand_match_summary
 from bihr_connector.db import get_session
 from bihr_connector.scheduler import DEFAULT_SLEEP_SECONDS, activate_brand, main_loop, run_cycle
 
@@ -104,6 +105,15 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
     for hint in hints:
         hints_by_brand.setdefault(hint.brand_code, []).append(hint)
 
+    matched = sum(1 for c in candidates if c.matched_manufacturer_id is not None)
+    with get_session() as bihr_session:
+        record_brand_match_summary(
+            bihr_session,
+            matched=matched,
+            unmatched=len(candidates) - matched,
+            hints=len(hints_by_brand),
+        )
+
     if args.print_report:
         for candidate in sorted(
             candidates, key=lambda c: c.master_product_count, reverse=True
@@ -116,7 +126,6 @@ def _cmd_match_brands(args: argparse.Namespace) -> int:
             for hint in hints_by_brand.get(candidate.brand_code, []):
                 print(f"\tposible: '{hint.label}' -> {hint.manufacturer_name} (id={hint.manufacturer_id})")
     else:
-        matched = sum(1 for c in candidates if c.matched_manufacturer_id is not None)
         print(f"Brand match: {matched}/{len(candidates)} brands matched in Reference Inteligencia")
         if hints_by_brand:
             print(f"  + {len(hints_by_brand)} unmatched brand(s) have a possible name-variant hint (--print-report to see them)")

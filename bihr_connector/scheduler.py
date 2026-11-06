@@ -36,6 +36,15 @@ the thin infinite-loop wrapper that is the container's actual entrypoint,
 calling `run_cycle` once per iteration and sleeping `sleep_seconds` in
 between, catching and logging any exception per cycle so one bad cycle (a
 BIHR outage, a transient DB error) doesn't kill the whole container.
+
+`run_cycle` also keeps the `connector_status` row (Hub-Task 1's
+recorders) current as it works: a `connector_status.record_catalog_result`
+call after every bulk-catalog attempt (success or failure), a
+`record_incremental_success` after every `SUCCESS` brand refresh, and a
+`record_brand_counts` once at the end of the cycle. `main_loop` records
+its own heartbeat independently, in a `finally` clause using a fresh
+session -- so a heartbeat is still written even when a cycle's own
+session/transaction failed outright.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from bihr_connector import connector_status
 from bihr_connector.bihr_client import BihrApiError
 from bihr_connector.catalog_parse import normalize_price
 from bihr_connector.catalog_sync import CatalogType, sync_catalog
@@ -98,6 +108,25 @@ def activate_brand(session: Session, brand_code: str) -> None:
 
     brand.is_active = True
     brand.activated_at = datetime.now(timezone.utc)
+    session.commit()
+
+
+def deactivate_brand(session: Session, brand_code: str) -> None:
+    """Mark a brand inactive so later refresh cycles stop picking it up.
+
+    Symmetric with `activate_brand`: sets `Brand.is_active = False` and
+    commits immediately -- also a standalone operator action, not part of
+    a larger multi-step transaction.
+
+    Raises:
+        ValueError: if `brand_code` doesn't exist in the `brands` table
+            (same contract as `activate_brand`).
+    """
+    brand = session.get(Brand, brand_code)
+    if brand is None:
+        raise ValueError(f"Unknown brand_code: {brand_code!r} (run sync-brands first?)")
+
+    brand.is_active = False
     session.commit()
 
 
@@ -412,7 +441,14 @@ def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
             run = sync_catalog(session, client, catalog_type, mode="full")
         except Exception:
             logger.exception("run_cycle: sync_catalog failed for catalog_type=%s", catalog_type)
+            # A hard sync_catalog exception is never a 429 rate-limit case
+            # in this codebase's design (catalog_sync has no rate-limit
+            # handling of its own) -- rate_limited is always False here.
+            connector_status.record_catalog_result(
+                session, catalog_type, succeeded=False, now=now, rate_limited=False
+            )
             continue
+        connector_status.record_catalog_result(session, catalog_type, succeeded=True, now=now)
         sync_runs.append(run)
 
     incremental_cadence = timedelta(hours=get_settings().INCREMENTAL_REFRESH_HOURS)
@@ -430,7 +466,13 @@ def run_cycle(session: Session, client: Any, now: datetime) -> list[SyncRun]:
         except Exception:
             logger.exception("run_cycle: refresh_active_brand failed for brand_code=%s", brand.brand_code)
             continue
+        if run.status == "SUCCESS":
+            connector_status.record_incremental_success(session, now=now)
         sync_runs.append(run)
+
+    brands_total = session.query(Brand).count()
+    brands_active = len(active_brands)
+    connector_status.record_brand_counts(session, total=brands_total, active=brands_active)
 
     return sync_runs
 
@@ -472,5 +514,14 @@ def main_loop(sleep_seconds: int = DEFAULT_SLEEP_SECONDS) -> None:
             )
         except Exception:
             logger.exception("main_loop: cycle failed, will retry after sleep")
+        finally:
+            # A fresh session, independent of whatever session run_cycle
+            # used -- so a heartbeat still gets written even if that
+            # cycle's own session/transaction failed.
+            try:
+                with get_session() as heartbeat_session:
+                    connector_status.update_heartbeat(heartbeat_session, now=datetime.now(timezone.utc))
+            except Exception:
+                logger.exception("main_loop: failed to record heartbeat")
 
         time.sleep(sleep_seconds)

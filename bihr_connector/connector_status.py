@@ -5,9 +5,9 @@ health: last heartbeat, per-catalog success/failure streaks, brand
 counts, and the brand-match summary. A separate project, connectors-hub
 (a different repo), will later read this table read-only to show the
 connector's sync health on a dashboard -- that consumer has no bearing
-on anything here. This module only writes the row; nothing in this task
-wires these helpers into the real scheduler loop yet (that is a later
-task), so every function here is called directly by tests only, for now.
+on anything here. This module only writes the row; `scheduler.run_cycle`/
+`main_loop` and `cli._cmd_match_brands` call these helpers to keep the
+row current as the connector actually runs.
 
 Every function takes an explicit ``now`` where it writes a timestamp
 (rather than calling ``datetime.now()`` internally) so tests can assert
@@ -25,6 +25,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from bihr_connector.catalog_sync import CatalogType
 from bihr_connector.models import ConnectorStatus
 
 CONNECTOR_NAME = "bihr"
@@ -65,7 +66,7 @@ def update_heartbeat(session: Session, now: datetime) -> None:
 
 def record_catalog_result(
     session: Session,
-    catalog_type: str,
+    catalog_type: CatalogType,
     succeeded: bool,
     now: datetime,
     rate_limited: bool = False,

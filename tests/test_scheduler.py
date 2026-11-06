@@ -26,11 +26,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from bihr_connector.bihr_client import BihrApiError
-from bihr_connector.models import Brand, Price, Product, SyncRun, SyncState
+from bihr_connector.connector_status import CONNECTOR_NAME
+from bihr_connector.models import Brand, ConnectorStatus, Price, Product, SyncRun, SyncState
 from bihr_connector.scheduler import (
     activate_brand,
     brand_due,
     catalog_due,
+    deactivate_brand,
     refresh_active_brand,
     run_cycle,
 )
@@ -164,6 +166,31 @@ def test_activate_brand_persists_across_session(db_session):
     db_session.expire_all()
     brand = db_session.get(Brand, "1063")
     assert brand.is_active is True
+
+
+# ---------------------------------------------------------------------------
+# deactivate_brand -- symmetric with activate_brand
+# ---------------------------------------------------------------------------
+
+
+def test_deactivate_brand_clears_flag(db_session):
+    _seed_brand(db_session, brand_code="1063", brand_name="BREMBO", is_active=True)
+    deactivate_brand(db_session, "1063")
+    brand = db_session.get(Brand, "1063")
+    assert brand.is_active is False
+
+
+def test_deactivate_brand_unknown_code_raises(db_session):
+    with pytest.raises(ValueError):
+        deactivate_brand(db_session, "0000")
+
+
+def test_deactivate_brand_persists_across_session(db_session):
+    _seed_brand(db_session, brand_code="1063", brand_name="BREMBO", is_active=True)
+    deactivate_brand(db_session, "1063")
+    db_session.expire_all()
+    brand = db_session.get(Brand, "1063")
+    assert brand.is_active is False
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +677,59 @@ def test_run_cycle_continues_other_catalogs_after_one_bulk_sync_fails(db_session
     assert "Stocks" in catalog_types
     assert "SalesCategories" in catalog_types
     assert any(r.mode == "incremental" for r in runs)  # brand refresh still ran
+
+
+# ---------------------------------------------------------------------------
+# run_cycle -- wiring into connector_status (Hub-Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_cycle_records_catalog_success(db_session, fake_full_cycle_client):
+    run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.catalogs["Products"]["status"] == "SUCCESS"
+
+
+def test_run_cycle_records_catalog_failure(db_session):
+    class OneCatalogFailsClient(FakeFullCycleBihrClient):
+        def download_catalog_file(self, file_id):
+            catalog_type = self.requested_catalog_types[-1]
+            if catalog_type == "Products":
+                raise BihrApiError("HTTP 500: server error", status_code=500)
+            return super().download_catalog_file(file_id)
+
+    client = OneCatalogFailsClient()
+
+    run_cycle(db_session, client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.catalogs["Products"]["status"] == "FAILED"
+    assert status.catalogs["Products"]["consecutive_failures"] == 1
+
+
+def test_run_cycle_records_incremental_success(db_session, fake_full_cycle_client):
+    _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
+
+    run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.last_incremental_sync_at is not None
+
+
+def test_run_cycle_records_brand_counts(db_session, fake_full_cycle_client):
+    _seed_brand_for_cycle(db_session, brand_code="1063", is_active=True)
+    _seed_brand_for_cycle(db_session, brand_code="1064", is_active=False)
+
+    run_cycle(db_session, fake_full_cycle_client, now=FIXED_NOW)
+
+    db_session.expire_all()
+    status = db_session.get(ConnectorStatus, CONNECTOR_NAME)
+    assert status.brands_total == 2
+    assert status.brands_active == 1
 
 
 # ---------------------------------------------------------------------------
