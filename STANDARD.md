@@ -171,6 +171,46 @@ class Product(Base):
 
 4. **Change tolerance:** Vendor APIs often add optional fields. Storing raw JSON means your schema doesn't break when the vendor adds a new property.
 
+## Incremental Commits, Not All-or-Nothing
+
+**Commit every `COMMIT_BATCH_SIZE` upserted records, not once at the end of the sync.** This generalizes beyond BIHR's own bulk-download-then-parse shape (where one API call already returns the whole payload atomically, so one commit at the end was a reasonable match for that risk profile) to any connector whose data collection itself takes real wall-clock time against a live, unreliable external system — a browser-driven scraper walking thousands of pages being the sharpest case, but the same logic applies to any multi-hour or multi-request ingestion.
+
+**Case study (DIRTFREAK connector, 2026-11-07):** the first live production crawl ran for 2.5 hours, successfully scraping thousands of pages, then hit a single `Page.goto` timeout on one product page. The timeout exception was a type the code didn't explicitly handle, so it propagated uncaught and crashed the whole cycle — but the deeper problem was independent of that specific bug: `sync_catalog` committed exactly once, at the very end, so **100% of 2.5 hours of real scraping was lost**, and `sync_runs` stayed empty the entire time, with zero visibility into whether the crawl was working, stalled, or already dead.
+
+```python
+# Module constant, not a Settings field — this is an internal durability/
+# throughput tradeoff with no operational reason to vary per deployment
+# (unlike something like BLOCK_THRESHOLD, which encodes vendor-specific
+# policy an operator may legitimately want to tune).
+COMMIT_BATCH_SIZE = 50
+
+def sync_catalog(session, client, ...):
+    batch = []
+    for raw in client.scrape_catalog(...):
+        # ... normalize, upsert (new or existing) ...
+        batch.append(obj)
+        if len(batch) >= COMMIT_BATCH_SIZE:
+            session.commit()
+            for o in batch:
+                session.expunge(o)   # bound memory to batch size, not table size
+            batch.clear()
+    if batch:
+        session.commit()
+        # ... final sweep, SyncRun, SyncState, final commit ...
+```
+
+**Why:**
+
+1. **Durability:** a failure partway through — a timeout, a crash, a container restart — loses at most `COMMIT_BATCH_SIZE` records' worth of progress, not the whole run. For a long-running scrape this is the difference between losing minutes of work and losing hours.
+
+2. **Memory:** look up each existing row lazily (`session.get(Model, pk)`) instead of preloading the whole table into a dict up front, and `session.expunge()` every object in a batch right after it commits. Without this, a `sessionmaker(expire_on_commit=False)` session (the standard setup — see `db.py`) never releases committed objects from its identity map, so memory grows with the whole run's record count, not with `COMMIT_BATCH_SIZE`.
+
+3. **Visibility:** a `SyncRun`/`sync_runs`-equivalent audit row should reflect reality as the run progresses (or at minimum be written with a `FAILED` status and partial counts if the run is interrupted), not stay silently empty until a single all-or-nothing commit either lands or never happens. "Is this run working?" must be answerable by reading the database, not only by tailing container logs.
+
+4. **The final "mark unseen-as-absent" sweep still runs exactly once, only on a fully-finished run** — same invariant as the `sync_state`/watermark rules above: a run that was aborted early (blocked, failed, interrupted) must never sweep, because it never saw enough of the catalog to know what's genuinely absent versus just not-yet-reached. Do this sweep as a single bulk `UPDATE ... WHERE is_present AND pk NOT IN (seen_this_run)` rather than a Python loop over preloaded rows, for the same memory reason as point 2 — but watch the database's bound-parameter limit (Postgres: ~65,535) if a catalog could ever grow large enough for the `NOT IN` list itself to approach it.
+
+5. **On a genuine, non-recoverable exception:** roll back only the in-flight batch (everything earlier already committed), then best-effort write a `SyncRun` row with `status="FAILED"` and the error message, in its own nested `try/except` so a failure writing that audit row can never mask the original exception.
+
 ## Secrets Management
 
 **Never commit secrets. Environment variables only.**
@@ -418,6 +458,7 @@ def mock_client():
 | Principle | Why | Where |
 |-----------|-----|-------|
 | **Watermark after commit** | Prevents data loss on crash; next cycle retries the same window | `sync_state` update rule |
+| **Incremental commits during collection** | A mid-run failure loses one batch, not the whole run (lost 2.5h of real scraping once); bounds memory; keeps `sync_runs` honest while a run is in progress | `sync_catalog`'s own commit loop (distinct from "single commit per cycle" below, which is about the scheduler's cycle-level orchestration, not one sync's internal batching) |
 | **Raw JSON + hash** | Audit trail, change detection, debugging, future re-parsing | Every record's `raw_json` + `raw_hash` |
 | **Secrets via .env** | Prevent credential leaks to source control | `config.py`, `.gitignore` |
 | **Bulk first, incremental second** | Reliable baseline before optimization | Phase 1 → Phase 4 sequencing |
@@ -428,5 +469,5 @@ def mock_client():
 
 ---
 
-**Version:** 1.0 (as of BIHR connector Fase 1)  
-**Next review:** After second connector is built (e.g., Parts Europe API)
+**Version:** 1.1 (added "Incremental Commits, Not All-or-Nothing" after the DIRTFREAK connector's first live crawl, 2026-11-07 — the second connector built on this standard, and the trigger for this review)
+**Next review:** After the third connector is built
